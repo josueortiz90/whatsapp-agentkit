@@ -195,6 +195,7 @@ El cliente recibe la respuesta en segundos
 - Si no sabe algo, responde: "No tengo esa informacion, dejame conectarte con alguien del equipo." y escala via la tool `escalar_a_humano`.
 - Cuando toma un pedido, NO te pide colonia/codigo postal — te pide una **descripcion libre** del domicilio + tu **ubicacion GPS** usando el boton nativo de WhatsApp. La direccion final queda con coordenadas exactas para el repartidor.
 - Cuando pides factura, recolecta **NIT/RFC + nombre + email** (valida el formato del email) y lo asocia al ultimo pedido.
+- Si el numero del agente esta dentro de un grupo de WhatsApp, los mensajes del grupo se ignoran automaticamente (chat_id `@g.us`). El agente esta hecho para atencion 1:1, no para participar en grupos.
 
 ---
 
@@ -206,6 +207,7 @@ El cliente recibe la respuesta en segundos
 - 📊 **Dashboard web de gestion** — `/dashboard` con HTTP Basic Auth. Inbox de conversaciones con filtros (pendientes/atendidas/escaladas), CRM de leads (nuevo/contactado/cliente/perdido), gestion de pedidos (pendiente/confirmado/enviado/entregado/cancelado) y KPIs agregados (ingresos confirmados, conversaciones pendientes, etc.).
 - 💾 **Persistencia real** — SQLAlchemy async con SQLite (dev) o PostgreSQL/Supabase (prod). Cuatro tablas: `mensajes`, `conversaciones`, `leads`, `pedidos` (con columnas `factura_nit/nombre/email`).
 - 🔌 **Patron adaptador para WhatsApp** — Tres proveedores intercambiables (Whapi.cloud, Meta Cloud API, Twilio). Cambiar de proveedor es cambiar una variable de entorno.
+- 🛡️ **Ignora chats grupales por defecto** — Si el numero del agente termina dentro de un grupo de WhatsApp, los mensajes del grupo (sufijo `@g.us`) se descartan en el provider, sin gastar tokens ni ensuciar el dashboard. El agente esta pensado para atencion 1:1.
 - 🚀 **Deploy a Railway con un clic** — Push a GitHub → Railway lo deploya. Variables de entorno desde el panel. Webhook publico HTTPS automatico.
 
 ---
