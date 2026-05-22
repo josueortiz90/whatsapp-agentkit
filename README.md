@@ -297,9 +297,119 @@ El cliente recibe la respuesta en segundos
 
 ---
 
+## Servicios externos: que usa AgentKit y para que
+
+AgentKit no reinventa la rueda. Conecta varios servicios especializados, cada uno con un rol claro. Aqui esta cada uno:
+
+### 🧠 Anthropic Claude API — el cerebro
+
+- **Que es:** El servicio de inteligencia artificial de Anthropic. Es el modelo de lenguaje (`claude-sonnet-4-5`) que entiende los mensajes del cliente, decide que responder y decide cuando ejecutar una accion (tool-use).
+- **Para que se usa en AgentKit:** Cada vez que un cliente escribe por WhatsApp, el agente le manda el mensaje + historial + tools disponibles a la API de Claude. Claude responde con texto o pidiendo ejecutar una tool. El "loop" se repite hasta que Claude da una respuesta final.
+- **Costo:** Pago por uso. ~$3 por millon de tokens de entrada (~750 mil palabras). Para un agente de WhatsApp normal son centavos por mes.
+- **Como conseguir:** [platform.anthropic.com](https://platform.anthropic.com/settings/api-keys) → Settings → API Keys → Create Key
+- **Variable de entorno:** `ANTHROPIC_API_KEY`
+
+### 📱 Whapi.cloud / Meta Cloud API / Twilio — el puente con WhatsApp
+
+- **Que son:** Servicios que conectan tu numero de WhatsApp con tu agente. WhatsApp no permite que conectes directamente — necesitas pasar por un proveedor que ya tiene los permisos.
+- **Para que se usan en AgentKit:**
+  - Reciben los mensajes que mandan tus clientes y los envian a tu webhook (URL publica de Railway).
+  - Envian las respuestas de tu agente de vuelta al cliente.
+  - Manejan medios: texto, imagenes, audios, ubicacion GPS, etc.
+- **Cual elegir:**
+
+| Proveedor | Dificultad | Costo | Cuando usarlo |
+|-----------|-----------|-------|---------------|
+| **[Whapi.cloud](https://whapi.cloud)** | ⭐ Facil | Sandbox gratis, planes desde ~$39/mes | Empezar rapido, probar, negocios pequenos |
+| **[Meta Cloud API](https://developers.facebook.com)** | ⭐⭐ Media | Gratis por conversacion (Meta cobra desde la segunda) | Produccion seria, oficial de WhatsApp |
+| **[Twilio](https://twilio.com)** | ⭐⭐ Media | Pago por mensaje (~$0.005/msg) | Empresas, alta confiabilidad |
+
+- **Variables de entorno:** dependen del proveedor (ver `.env.example`). Whapi: `WHAPI_TOKEN`. Meta: `META_ACCESS_TOKEN` + `META_PHONE_NUMBER_ID` + `META_VERIFY_TOKEN`. Twilio: `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `TWILIO_PHONE_NUMBER`.
+
+### 💾 Supabase (o cualquier PostgreSQL) — la base de datos en produccion
+
+- **Que es:** Supabase es un servicio que te da una base de datos PostgreSQL en la nube con un panel web para verla, plan free generoso (500 MB), y sin necesidad de administrar servidor.
+- **Para que se usa en AgentKit:** Guarda persistentemente los mensajes, conversaciones, leads, pedidos y datos de facturacion del agente. Tu dashboard lee de aqui. En desarrollo local puedes usar SQLite (un archivo `.db`), pero en produccion Railway necesita una BD externa porque los contenedores se reinician sin estado.
+- **Por que Supabase:** El plan free incluye 500 MB de PostgreSQL, panel visual para inspeccionar datos, y un connection string listo para usar. Alternativas validas: PostgreSQL en Railway (mas integrado pero plan free mas chico), Neon, AWS RDS, etc. Si la conexion string es `postgresql://...`, el codigo la acepta.
+- **Costo:** Free hasta 500 MB y 50,000 mensajes mensuales activos. Pro $25/mes si creces.
+- **Como conseguir:** [supabase.com](https://supabase.com) → New project → Settings → Database → Connection string → **modo Session pooler** (importante: NO Transaction, es incompatible con `asyncpg` por prepared statements).
+- **Variable de entorno:** `DATABASE_URL=postgresql://user:pass@host:5432/postgres`
+- ⚠️ Si tu password tiene caracteres especiales como `+` o `@`, URL-encode esos caracteres (`+` → `%2B`, `@` → `%40`).
+
+### 🚀 Railway — el hosting de tu agente
+
+- **Que es:** Una plataforma para deployar codigo de GitHub a internet con un par de clics. Sin configurar servidores, sin Kubernetes, sin DevOps. Detecta tu `Dockerfile` o `requirements.txt` y arma el contenedor solo.
+- **Para que se usa en AgentKit:** Aloja tu agente en una URL publica HTTPS (`https://tu-app.up.railway.app`) que es la que apunta el webhook de tu proveedor de WhatsApp. Cuando un cliente manda un mensaje, llega a Railway, se procesa y se responde.
+- **Por que Railway:** El plan free incluye $5 de credito mensual, suficiente para un agente activo de bajo volumen. Conecta directo a GitHub: push a `main` → redeploy automatico. Variables de entorno desde el panel (no hay que tocar el `.env`). Alternativas: Render, Fly.io, AWS App Runner, Google Cloud Run.
+- **Costo:** Plan Hobby $5/mes de credito incluido. Pago por uso (RAM + CPU + ancho de banda).
+- **Como conseguir:** [railway.app](https://railway.app) → New Project → Deploy from GitHub repo → seleccionas TU repo privado del agente.
+- **Variables a configurar en Railway:** `ANTHROPIC_API_KEY`, las del proveedor (Whapi/Meta/Twilio), `DATABASE_URL` (Supabase), `DASHBOARD_USER`, `DASHBOARD_PASSWORD`, `PORT=8000`, `ENVIRONMENT=production`.
+
+### 🐙 GitHub — versionado + integracion con Railway
+
+- **Que es:** Plataforma de Git mas usada. Aloja codigo y se integra con Railway, Vercel, Cloudflare, etc.
+- **Para que se usa en AgentKit:**
+  - Guardar el codigo del **template** (publico, este repo) para que otros usuarios lo clonen.
+  - Guardar el codigo de **TU agente generado** (privado, repo separado) para que Railway lo deploye.
+  - GitHub Actions opcionales para CI/CD.
+- **Costo:** Free para repos publicos. Free para repos privados ilimitados con colaboradores limitados (suficiente para un solo dueno).
+- **Como conseguir:** [github.com](https://github.com) → New repository.
+
+### 🔌 cloudflared — tunel local para probar webhook (solo desarrollo)
+
+- **Que es:** Una herramienta de Cloudflare que crea un tunel publico HTTPS hacia un servicio que corre en tu maquina (`localhost:8000`). No requiere cuenta ni signup.
+- **Para que se usa en AgentKit:** Cuando estas desarrollando localmente y quieres probar el webhook con WhatsApp REAL antes de deployar a Railway. Sin un tunel, el proveedor (Whapi/Meta/Twilio) no puede mandarle mensajes a tu `localhost`.
+- **Costo:** Gratis. Sin cuenta. La URL es efimera (cambia cada vez que reinicias).
+- **Como instalar:**
+  - **Mac/Linux:** `brew install cloudflared`
+  - **Windows:** `winget install Cloudflare.cloudflared`
+- **Como usarlo:** Levantas uvicorn en local en :8000, luego en otra terminal: `cloudflared tunnel --url http://localhost:8000`. Te da una URL `https://*.trycloudflare.com` que apuntas en el webhook del proveedor.
+- **Alternativa:** [ngrok](https://ngrok.com) (funciona igual pero requiere cuenta gratuita).
+
+### 🐳 Docker — contenedores para deploy alternativo (opcional)
+
+- **Que es:** Sistema de contenedores. Cada agente se empaqueta en una imagen Docker reproducible.
+- **Para que se usa en AgentKit:** Railway usa Docker por debajo automaticamente. Solo necesitas tocarlo si quieres deployar a otro sitio (tu propio servidor, AWS, GCP, etc.) o correr localmente con `docker compose up`.
+- **Costo:** Free.
+- **Cuando lo necesitas:** Si Railway no te conviene y prefieres self-hosting en tu propio servidor.
+
+### Resumen visual
+
+```
+            ┌─────────────────────────────────────────────┐
+            │  Cliente final manda mensaje por WhatsApp   │
+            └───────────────────┬─────────────────────────┘
+                                │
+                                v
+                ┌──────────────────────────────────────┐
+                │  Whapi.cloud / Meta Cloud API /      │
+                │  Twilio  (eliges UNO)                │
+                │  Rol: puente con WhatsApp            │
+                └──────────────┬───────────────────────┘
+                               │ POST /webhook
+                               v
+            ┌──────────────────────────────────────────┐
+            │  Tu agente corriendo en Railway          │
+            │  Rol: hosting publico HTTPS              │
+            └────┬──────────────┬────────────────┬─────┘
+                 │              │                │
+        consulta │       persiste│         renderiza
+                 v              v                v
+       ┌──────────────┐  ┌──────────────┐  ┌─────────────┐
+       │ Anthropic    │  │ Supabase     │  │ Dashboard   │
+       │ Claude API   │  │ PostgreSQL   │  │ /dashboard  │
+       │ Rol: cerebro │  │ Rol: BD prod │  │ Rol: humano │
+       └──────────────┘  └──────────────┘  └─────────────┘
+
+   Para versionado:  GitHub (template publico + repo privado del agente)
+   Para dev local:   cloudflared (tunel HTTPS hacia localhost:8000)
+```
+
+---
+
 ## Requisitos previos
 
-Necesitas 4 cosas antes de empezar:
+Necesitas estas cuentas/herramientas antes de empezar. Las 4 primeras son obligatorias; las 3 ultimas solo si vas a deployar a produccion.
 
 ### 1. Python 3.11 o superior
 - **Mac**: `brew install python` o descarga de [python.org](https://www.python.org/downloads/)
@@ -331,6 +441,35 @@ claude
 | [Twilio](https://twilio.com) | Media | Pago por mensaje | Empresas, alta confiabilidad |
 
 **Si no estas seguro, empieza con Whapi.cloud.** Es la opcion mas rapida — te registras, copias un token, y listo.
+
+### 5. (Opcional para produccion) Cuenta de Supabase
+
+Solo si vas a deployar el agente: necesitas una base de datos PostgreSQL en la nube.
+
+1. Ve a [supabase.com](https://supabase.com) y crea cuenta
+2. New project → guarda el password de BD que generes (no lo veras de nuevo)
+3. Espera 1-2 minutos a que el proyecto este "Healthy" (verde)
+4. Settings → Database → Connection string → **modo Session pooler**
+5. Copia la cadena, reemplaza `[YOUR-PASSWORD]` por la real (URL-encoded si tiene `+` o `@`)
+
+Si solo vas a probar el agente en local con `test_local.py`, **NO necesitas Supabase** — usa SQLite por defecto.
+
+### 6. (Opcional para produccion) Cuenta de Railway
+
+Para alojar el agente en internet con una URL publica.
+
+1. Ve a [railway.app](https://railway.app)
+2. Autoriza Railway en tu cuenta de GitHub (le da acceso a tus repos)
+3. Plan Hobby trae $5/mes de credito gratis — suficiente para empezar
+
+### 7. (Opcional, solo dev local con WhatsApp real) cloudflared
+
+Si quieres probar el webhook con WhatsApp real sin deployar, instala cloudflared:
+
+- **Mac/Linux:** `brew install cloudflared`
+- **Windows:** `winget install Cloudflare.cloudflared`
+
+Lo usaras asi: `cloudflared tunnel --url http://localhost:8000` para crear un tunel HTTPS publico.
 
 ---
 
