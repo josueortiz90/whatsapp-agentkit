@@ -293,6 +293,7 @@ El cliente recibe la respuesta en segundos
 - 💾 **Persistencia real** — SQLAlchemy async con SQLite (dev) o PostgreSQL/Supabase (prod). Cuatro tablas: `mensajes`, `conversaciones`, `leads`, `pedidos` (con columnas `factura_nit/nombre/email`).
 - 🔌 **Patron adaptador para WhatsApp** — Tres proveedores intercambiables (Whapi.cloud, Meta Cloud API, Twilio). Cambiar de proveedor es cambiar una variable de entorno.
 - 🛡️ **Ignora chats grupales por defecto** — Si el numero del agente termina dentro de un grupo de WhatsApp, los mensajes del grupo (sufijo `@g.us`) se descartan en el provider, sin gastar tokens ni ensuciar el dashboard. El agente esta pensado para atencion 1:1.
+- 📊 **Observabilidad con Langfuse (opcional)** — Cada mensaje del cliente se trazea: tokens, costo, latencia, tools invocadas, errores. Si las keys no estan configuradas, el agente sigue funcionando sin tracing (cero overhead). Free tier de 50k observaciones/mes.
 - 🚀 **Deploy a Railway con un clic** — Push a GitHub → Railway lo deploya. Variables de entorno desde el panel. Webhook publico HTTPS automatico.
 
 ---
@@ -344,6 +345,16 @@ AgentKit no reinventa la rueda. Conecta varios servicios especializados, cada un
 - **Costo:** Plan Hobby $5/mes de credito incluido. Pago por uso (RAM + CPU + ancho de banda).
 - **Como conseguir:** [railway.app](https://railway.app) → New Project → Deploy from GitHub repo → seleccionas TU repo privado del agente.
 - **Variables a configurar en Railway:** `ANTHROPIC_API_KEY`, las del proveedor (Whapi/Meta/Twilio), `DATABASE_URL` (Supabase), `DASHBOARD_USER`, `DASHBOARD_PASSWORD`, `PORT=8000`, `ENVIRONMENT=production`.
+
+### 📊 Langfuse — observabilidad de prompts y costos (opcional)
+
+- **Que es:** Plataforma para tracear cada llamada al LLM. Te muestra: cuanto cuesta cada conversacion, latencia, tokens usados, distribucion de tools, errores. Open source con cloud gratis.
+- **Para que se usa en AgentKit:** `agent/observability.py` envuelve el tool-use loop. Cada mensaje del cliente se ve en Langfuse como un trace; cada llamada a Claude como una generation con tokens y costo calculados automaticamente; cada tool ejecutada como un sub-span con input/output. Se agrupa por `user_id = telefono` para ver la historia de cada cliente.
+- **Por que es util:** Sin esto, cuando tu agente "se porta raro" con un cliente especifico, no tienes forma de ver QUE le mandaste a Claude. Con Langfuse abres ese trace y ves el prompt + tools + respuesta exactos.
+- **Costo:** Free tier 50,000 observations/mes (~10-20 mil conversaciones segun cuantos tool calls tengas). Plan Pro $59/mes despues. Self-host gratis con Docker si prefieres.
+- **Como conseguir:** [cloud.langfuse.com](https://cloud.langfuse.com) → New project → Settings → API Keys → Create. Te dan 2 keys (`pk-lf-...` y `sk-lf-...`).
+- **Variables de entorno:** `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` (default `https://cloud.langfuse.com`).
+- **Si las keys estan vacias:** el agente sigue funcionando sin tracing, no falla.
 
 ### 🐙 GitHub — versionado + integracion con Railway
 

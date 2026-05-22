@@ -54,6 +54,7 @@ pyyaml>=6.0.1
 aiosqlite>=0.19.0
 python-multipart>=0.0.6
 jinja2>=3.1.0
+langfuse>=3.0.0,<4.0.0
 ```
 
 ---
@@ -379,6 +380,29 @@ system_prompt: |
   La tool actualiza el ÚLTIMO pedido del cliente, así que se pide normalmente tras
   `confirmar_pedido`. Si el cliente la pide antes y no hay pedido, guarda los datos
   en tu memoria y aplícalos justo después de cerrar el pedido.
+
+  **Terminología:** llama al documento **"factura digital"**. NO uses términos
+  técnicos específicos de un país ("CFDI" en México, "comprobante fiscal", "XML")
+  porque confunden a clientes de otras regiones. Al confirmar di:
+  "Tu **factura digital** se enviará en PDF al correo [email] después de la entrega."
+
+  ## Métodos de pago habilitados (incluir SOLO si el agente toma pedidos)
+
+  Lista explícita y cerrada de qué pagos se aceptan. Genera esta sección con los
+  métodos REALES del negocio (uno o varios). Si la lista es restringida, indícalo
+  claramente para que el agente no ofrezca métodos no soportados. Plantilla:
+
+      Métodos habilitados actualmente:
+        ✅ [Método A] — descripción breve
+        ✅ [Método B] — descripción breve (opcional)
+        🔜 [Método C] — próximamente, aún no disponible (opcional)
+
+      Si el cliente pregunta por otros métodos no listados, explica amablemente
+      que solo están habilitados los de arriba y NO los aceptes ni los confirmes.
+
+  Ejemplo (ferretería con un solo método activo):
+      ✅ Pago contra entrega en efectivo — único método activo actualmente.
+      🔜 Pago con QR — próximamente.
 
   ## Reglas de comportamiento
   - SIEMPRE responde en español
@@ -1955,4 +1979,88 @@ DASHBOARD_PASSWORD=cambiame-por-favor
 
 # Modelo Claude (opcional, default claude-sonnet-4-5)
 # CLAUDE_MODEL=claude-sonnet-4-5
+
+# Langfuse (observabilidad, opcional). Si las dos keys están vacías,
+# el tracing se desactiva y el agente sigue funcionando.
+# LANGFUSE_PUBLIC_KEY=
+# LANGFUSE_SECRET_KEY=
+# LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+### Módulo `agent/observability.py`
+
+Si el agente va a producción, conviene instrumentar con **Langfuse** (cloud o self-host) para ver costos por conversación, distribución de tools usadas, latencia y errores. El módulo debe ser tolerante a que las keys no estén: si no, el agente funciona sin tracing.
+
+```python
+# agent/observability.py — Wrapper de Langfuse (tracing opcional)
+import logging, os
+from typing import Any
+logger = logging.getLogger("agentkit")
+
+
+class _NoopObservation:
+    """Imita un span/generation de Langfuse cuando el tracing está apagado."""
+    def update(self, *a, **kw): return self
+    def end(self, *a, **kw): return self
+    def start_span(self, *a, **kw): return _NoopObservation()
+    def start_generation(self, *a, **kw): return _NoopObservation()
+
+
+class _NoopClient:
+    def start_span(self, *a, **kw): return _NoopObservation()
+    def start_generation(self, *a, **kw): return _NoopObservation()
+    def flush(self): pass
+
+
+def _build_client():
+    pub = (os.getenv("LANGFUSE_PUBLIC_KEY") or "").strip()
+    sec = (os.getenv("LANGFUSE_SECRET_KEY") or "").strip()
+    host = (os.getenv("LANGFUSE_HOST") or "https://cloud.langfuse.com").strip()
+    if not pub or not sec:
+        return _NoopClient()
+    try:
+        from langfuse import Langfuse
+        return Langfuse(public_key=pub, secret_key=sec, host=host)
+    except Exception as e:
+        logger.warning(f"Langfuse off: {e}")
+        return _NoopClient()
+
+
+langfuse_client = _build_client()
+```
+
+### Cómo usarlo en `brain.py`
+
+Envuelve el tool-use loop con un `start_span` raíz por mensaje del cliente, una `start_generation` por cada llamada a Claude (capturando `usage_details` para que Langfuse calcule costos) y un `start_span` por tool ejecutada. `user_id=session_id=telefono` agrupa todos los mensajes del mismo cliente.
+
+```python
+from agent.observability import langfuse_client
+
+# Dentro de generar_respuesta(...):
+trace = langfuse_client.start_span(
+    name="whatsapp-message",
+    input={"mensaje": mensaje, "historial_size": len(historial)},
+    metadata={"telefono": telefono, "channel": "whatsapp"},
+)
+try: trace.update_trace(user_id=telefono, session_id=telefono)
+except AttributeError: pass
+
+try:
+    for iteracion in range(MAX_TOOL_ITERATIONS):
+        gen = trace.start_generation(name=f"claude-iter-{iteracion}",
+                                     model=MODEL_ID, input=mensajes,
+                                     model_parameters={"max_tokens": MAX_TOKENS})
+        response = await client.messages.create(...)
+        gen.update(output=content_dump,
+                   usage_details={"input": response.usage.input_tokens,
+                                  "output": response.usage.output_tokens})
+        gen.end()
+        ...
+        for block in tool_blocks:
+            tool_span = trace.start_span(name=f"tool:{block.name}", input=block.input)
+            resultado = await ejecutar_tool(...)
+            tool_span.update(output=resultado); tool_span.end()
+finally:
+    trace.update(output=respuesta_final)
+    trace.end()
 ```
