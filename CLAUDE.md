@@ -32,10 +32,12 @@ Cuando generes el agente, SIEMPRE usa estas tecnologías:
 | Componente | Tecnología | Notas |
 |-----------|-----------|-------|
 | Runtime | Python 3.11+ | Verificar en Fase 1 |
-| Servidor | FastAPI + Uvicorn | Webhook handler genérico |
-| IA | Anthropic Claude API | Modelo: `claude-sonnet-4-6` |
+| Servidor | FastAPI + Uvicorn | Webhook handler genérico + dashboard |
+| IA | Anthropic Claude API | Modelo: `claude-sonnet-4-5` (tool-use habilitado) |
 | WhatsApp | Whapi.cloud / Meta Cloud API / Twilio | El usuario elige durante el setup |
-| Base de datos | SQLite (local) / PostgreSQL (prod) | Via SQLAlchemy |
+| Base de datos | SQLite (local) / PostgreSQL (prod) | Via SQLAlchemy. Tablas: mensajes, conversaciones, leads, pedidos |
+| Dashboard | FastAPI + Jinja2 + HTMX-style | Server-rendered, sin build de frontend |
+| Auth dashboard | HTTP Basic Auth | DASHBOARD_USER + DASHBOARD_PASSWORD en .env |
 | Variables | python-dotenv | NUNCA hardcodear keys |
 | Contenedores | Docker Compose | Para producción |
 | Deploy | Railway | Un clic desde GitHub |
@@ -51,6 +53,7 @@ sqlalchemy>=2.0.0
 pyyaml>=6.0.1
 aiosqlite>=0.19.0
 python-multipart>=0.0.6
+jinja2>=3.1.0
 ```
 
 ---
@@ -63,14 +66,19 @@ Claude Code genera esta estructura completa para cada usuario:
 agentkit/
 ├── agent/
 │   ├── __init__.py        ← Package init
-│   ├── main.py            ← FastAPI app + webhook (provider-agnostic)
-│   ├── brain.py           ← Conexión Claude API + system prompt desde prompts.yaml
-│   ├── memory.py          ← SQLAlchemy + SQLite, historial por número de teléfono
-│   ├── tools.py           ← Herramientas específicas del negocio del usuario
-│   └── providers/
-│       ├── __init__.py    ← Factory: obtener_proveedor() según .env
-│       ├── base.py        ← Clase abstracta ProveedorWhatsApp
-│       └── whapi.py       ← Adaptador del proveedor elegido (o meta.py, o twilio.py)
+│   ├── main.py            ← FastAPI app + webhook + monta dashboard router
+│   ├── brain.py           ← Claude API con tool-use loop (acciones dinámicas)
+│   ├── memory.py          ← SQLAlchemy: mensajes, conversaciones, leads, pedidos + métricas
+│   ├── tools.py           ← Tool schemas + funciones + despachador async (efectos persistentes)
+│   ├── providers/
+│   │   ├── __init__.py    ← Factory: obtener_proveedor() según .env
+│   │   ├── base.py        ← Clase abstracta ProveedorWhatsApp
+│   │   └── whapi.py       ← Adaptador del proveedor elegido (o meta.py, o twilio.py)
+│   └── dashboard/         ← Gestión web del negocio (HTTP Basic Auth)
+│       ├── __init__.py    ← Expone dashboard_router
+│       ├── auth.py        ← HTTP Basic Auth (DASHBOARD_USER/PASSWORD)
+│       ├── routes.py      ← /dashboard, /dashboard/leads, /dashboard/pedidos, etc.
+│       └── templates/     ← Jinja2: base.html, inbox.html, conversacion.html, leads.html, pedidos.html
 ├── config/
 │   ├── business.yaml      ← Datos del negocio (generado en entrevista)
 │   └── prompts.yaml       ← System prompt del agente (generado, poderoso y específico)
@@ -79,10 +87,10 @@ agentkit/
 ├── tests/
 │   ├── __init__.py
 │   └── test_local.py      ← Chat interactivo en terminal (simula WhatsApp)
-├── requirements.txt       ← Dependencias Python
+├── requirements.txt       ← Dependencias Python (incluye jinja2 para dashboard)
 ├── Dockerfile             ← Imagen Docker para producción
 ├── docker-compose.yml     ← Orquestación con variables de entorno
-└── .env                   ← API keys del usuario (NUNCA va a GitHub)
+└── .env                   ← API keys del usuario + DASHBOARD_USER/PASSWORD (NUNCA va a GitHub)
 ```
 
 ### Flujo de un mensaje:
@@ -96,18 +104,30 @@ Providers (agent/providers/) — normaliza el mensaje a formato común
     ↓
 FastAPI (agent/main.py) — recibe MensajeEntrante normalizado
     ↓
-Memory (agent/memory.py) — recupera historial de esa conversación
+Memory (agent/memory.py) — recupera historial + actualiza tabla Conversacion
     ↓
-Brain (agent/brain.py) — llama Claude API con: system prompt + historial + mensaje nuevo
-    ↓
-Claude API (claude-sonnet-4-6) — genera respuesta inteligente
-    ↓
-Tools (agent/tools.py) — si necesita hacer algo (agendar, buscar, etc.)
+Brain (agent/brain.py) — Claude API con tool-use loop
+    ↓                              ↓
+Claude API genera respuesta   Si Claude pide una tool (registrar_lead,
+    ↓                          confirmar_pedido, escalar_a_humano, etc.)
+    ↓                          → Tools persisten en Lead/Pedido/Conversacion
     ↓
 Providers (agent/providers/) — envía respuesta via el proveedor elegido
     ↓
 WhatsApp (cliente recibe respuesta)
 ```
+
+### Dashboard (gestión humana):
+
+```
+Browser → GET /dashboard         → Inbox (lista de conversaciones, KPIs)
+        → GET /dashboard/conversacion/{tel}  → Hilo + acciones (marcar atendida, convertir a lead)
+        → GET /dashboard/leads    → CRM básico de leads (status: nuevo/contactado/cliente/perdido)
+        → GET /dashboard/pedidos  → Pedidos pendientes (status: pendiente/confirmado/enviado/entregado/cancelado)
+```
+
+Todos los endpoints están protegidos por HTTP Basic Auth (`DASHBOARD_USER` + `DASHBOARD_PASSWORD`).
+Si `DASHBOARD_PASSWORD` está vacío, el dashboard responde 503.
 
 ---
 
@@ -613,67 +633,62 @@ class ProveedorTwilio(ProveedorWhatsApp):
 
 #### 3.4 — `agent/main.py`
 
-Genera el servidor FastAPI **provider-agnostic**:
+FastAPI app: webhook (provider-agnostic) + dashboard router montado en `/dashboard`.
 
 ```python
-# agent/main.py — Servidor FastAPI + Webhook de WhatsApp
+# agent/main.py — Servidor FastAPI: webhook WhatsApp + dashboard
 # Generado por AgentKit
 
-"""
-Servidor principal del agente de WhatsApp.
-Funciona con cualquier proveedor (Whapi, Meta, Twilio) gracias a la capa de providers.
-"""
-
-import os
 import logging
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
+
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from agent.brain import generar_respuesta
-from agent.memory import inicializar_db, guardar_mensaje, obtener_historial
+from agent.dashboard import dashboard_router
+from agent.memory import guardar_mensaje, inicializar_db, obtener_historial
 from agent.providers import obtener_proveedor
 
 load_dotenv()
 
-# Configuración de logging según entorno
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
-logging.basicConfig(level=log_level)
+logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("agentkit")
 
-# Proveedor de WhatsApp (se configura en .env con WHATSAPP_PROVIDER)
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Inicializa la base de datos al arrancar el servidor."""
     await inicializar_db()
     logger.info("Base de datos inicializada")
     logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
     logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
+    if not os.getenv("DASHBOARD_PASSWORD"):
+        logger.warning(
+            "DASHBOARD_PASSWORD no configurada — el dashboard responderá 503. "
+            "Define DASHBOARD_USER y DASHBOARD_PASSWORD en .env"
+        )
     yield
 
 
-app = FastAPI(
-    title="AgentKit — WhatsApp AI Agent",
-    version="1.0.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="AgentKit — WhatsApp AI Agent", version="1.1.0", lifespan=lifespan)
+app.include_router(dashboard_router)
 
 
 @app.get("/")
 async def health_check():
-    """Endpoint de salud para Railway/monitoreo."""
     return {"status": "ok", "service": "agentkit"}
 
 
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
-    """Verificación GET del webhook (requerido por Meta Cloud API, no-op para otros)."""
+    """Verificación GET del webhook (Meta Cloud API)."""
     resultado = await proveedor.validar_webhook(request)
     if resultado is not None:
         return PlainTextResponse(str(resultado))
@@ -683,167 +698,179 @@ async def webhook_verificacion(request: Request):
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     """
-    Recibe mensajes de WhatsApp via el proveedor configurado.
-    Procesa el mensaje, genera respuesta con Claude y la envía de vuelta.
+    Recibe mensajes, los pasa por Claude (con tool-use) y responde por WhatsApp.
+    Cada mensaje queda persistido en SQLite; el dashboard lo muestra en /dashboard.
     """
     try:
-        # Parsear webhook — el proveedor normaliza el formato
         mensajes = await proveedor.parsear_webhook(request)
-
         for msg in mensajes:
-            # Ignorar mensajes propios o vacíos
             if msg.es_propio or not msg.texto:
                 continue
-
             logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
 
-            # Obtener historial ANTES de guardar el mensaje actual
-            # (brain.py agrega el mensaje actual, evitando duplicados)
             historial = await obtener_historial(msg.telefono)
 
-            # Generar respuesta con Claude
-            respuesta = await generar_respuesta(msg.texto, historial)
+            # IMPORTANTE: pasar telefono — brain lo necesita para las tools
+            # (registrar_lead, confirmar_pedido, escalar_a_humano)
+            respuesta = await generar_respuesta(msg.texto, historial, telefono=msg.telefono)
 
-            # Guardar mensaje del usuario Y respuesta del agente en memoria
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta)
-
-            # Enviar respuesta por WhatsApp via el proveedor
             await proveedor.enviar_mensaje(msg.telefono, respuesta)
-
             logger.info(f"Respuesta a {msg.telefono}: {respuesta}")
-
         return {"status": "ok"}
-
     except Exception as e:
-        logger.error(f"Error en webhook: {e}")
+        logger.error(f"Error en webhook: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 ```
 
 #### 3.5 — `agent/brain.py`
 
+Cerebro con **tool-use loop**. Si Claude pide ejecutar una tool (consultar_stock, registrar_lead, confirmar_pedido, etc.) la ejecutamos y devolvemos el resultado para que continúe la conversación.
+
 ```python
-# agent/brain.py — Cerebro del agente: conexión con Claude API
+# agent/brain.py — Cerebro del agente: tool-use loop con Claude
 # Generado por AgentKit
 
-"""
-Lógica de IA del agente. Lee el system prompt de prompts.yaml
-y genera respuestas usando la API de Anthropic Claude.
-"""
-
-import os
-import yaml
+import json
 import logging
+import os
+
+import yaml
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+
+from agent.tools import TOOLS, ejecutar_tool
 
 load_dotenv()
 logger = logging.getLogger("agentkit")
 
-# Cliente de Anthropic
 client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+MODEL_ID = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+MAX_TOKENS = 1024
+MAX_TOOL_ITERATIONS = 6  # tope para evitar loops infinitos
 
 
-def cargar_config_prompts() -> dict:
-    """Lee toda la configuración desde config/prompts.yaml."""
+def _cargar_config() -> dict:
     try:
         with open("config/prompts.yaml", "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except FileNotFoundError:
-        logger.error("config/prompts.yaml no encontrado")
-        return {}
+        logger.error("config/prompts.yaml no encontrado"); return {}
 
 
 def cargar_system_prompt() -> str:
-    """Lee el system prompt desde config/prompts.yaml."""
-    config = cargar_config_prompts()
-    return config.get("system_prompt", "Eres un asistente útil. Responde en español.")
+    return _cargar_config().get("system_prompt", "Eres un asistente útil. Responde en español.")
 
 
 def obtener_mensaje_error() -> str:
-    """Retorna el mensaje de error configurado en prompts.yaml."""
-    config = cargar_config_prompts()
-    return config.get("error_message", "Lo siento, estoy teniendo problemas técnicos. Por favor intenta de nuevo en unos minutos.")
+    return _cargar_config().get("error_message",
+        "Lo siento, estoy teniendo problemas técnicos. Intenta de nuevo en unos minutos.")
 
 
 def obtener_mensaje_fallback() -> str:
-    """Retorna el mensaje de fallback configurado en prompts.yaml."""
-    config = cargar_config_prompts()
-    return config.get("fallback_message", "Disculpa, no entendí tu mensaje. ¿Podrías reformularlo?")
+    return _cargar_config().get("fallback_message",
+        "Disculpa, no entendí tu mensaje. ¿Podrías reformularlo?")
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
+def _serializar_tool_result(resultado) -> str:
+    try: return json.dumps(resultado, ensure_ascii=False, default=str)
+    except (TypeError, ValueError): return str(resultado)
+
+
+def _extraer_texto(content_blocks) -> str:
+    partes = []
+    for b in content_blocks:
+        tipo = getattr(b, "type", None) or (b.get("type") if isinstance(b, dict) else None)
+        if tipo == "text":
+            texto = getattr(b, "text", None) or (b.get("text") if isinstance(b, dict) else "")
+            if texto: partes.append(texto)
+    return "\n".join(partes).strip()
+
+
+async def generar_respuesta(mensaje: str, historial: list[dict], telefono: str = "") -> str:
     """
-    Genera una respuesta usando Claude API.
-
     Args:
-        mensaje: El mensaje nuevo del usuario
-        historial: Lista de mensajes anteriores [{"role": "user/assistant", "content": "..."}]
-
-    Returns:
-        La respuesta generada por Claude
+        mensaje:   nuevo mensaje del usuario (NO incluido en historial)
+        historial: mensajes previos en orden cronológico [{role, content}]
+        telefono:  número del cliente; las tools lo usan para persistir leads/pedidos
     """
-    # Si el mensaje es muy corto o vacío, usar fallback
     if not mensaje or len(mensaje.strip()) < 2:
         return obtener_mensaje_fallback()
 
     system_prompt = cargar_system_prompt()
-
-    # Construir mensajes para la API
-    mensajes = []
-    for msg in historial:
-        mensajes.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
-
-    # Agregar el mensaje actual
-    mensajes.append({
-        "role": "user",
-        "content": mensaje
-    })
+    mensajes = [{"role": m["role"], "content": m["content"]} for m in historial]
+    mensajes.append({"role": "user", "content": mensaje})
 
     try:
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=mensajes
-        )
+        for iteracion in range(MAX_TOOL_ITERATIONS):
+            response = await client.messages.create(
+                model=MODEL_ID, max_tokens=MAX_TOKENS,
+                system=system_prompt, tools=TOOLS, messages=mensajes,
+            )
+            logger.info(f"iter={iteracion} stop_reason={response.stop_reason} "
+                        f"tokens={response.usage.input_tokens}in/{response.usage.output_tokens}out")
 
-        respuesta = response.content[0].text
-        logger.info(f"Respuesta generada ({response.usage.input_tokens} in / {response.usage.output_tokens} out)")
-        return respuesta
+            if response.stop_reason != "tool_use":
+                return _extraer_texto(response.content) or obtener_mensaje_fallback()
 
+            # Procesar tool_use: agregar assistant con TODO el content, luego tool_results
+            mensajes.append({
+                "role": "assistant",
+                "content": [b.model_dump() if hasattr(b, "model_dump") else b for b in response.content],
+            })
+            tool_results = []
+            for block in response.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                logger.info(f"  tool_use: {block.name}({block.input})")
+                resultado = await ejecutar_tool(block.name, block.input or {}, telefono)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": _serializar_tool_result(resultado),
+                })
+            mensajes.append({"role": "user", "content": tool_results})
+
+        logger.warning("Alcanzado MAX_TOOL_ITERATIONS sin respuesta final")
+        return obtener_mensaje_fallback()
     except Exception as e:
-        logger.error(f"Error Claude API: {e}")
+        logger.error(f"Error Claude API: {e}", exc_info=True)
         return obtener_mensaje_error()
 ```
 
 #### 3.6 — `agent/memory.py`
 
+Persiste mensajes, conversaciones, leads y pedidos. El dashboard lee de aquí.
+
 ```python
-# agent/memory.py — Memoria de conversaciones con SQLite
+# agent/memory.py — Memoria + estado conversacional con SQLite/PostgreSQL
 # Generado por AgentKit
 
 """
-Sistema de memoria del agente. Guarda el historial de conversaciones
-por número de teléfono usando SQLite (local) o PostgreSQL (producción).
+Tablas:
+  - mensajes:       hilo crudo (user/assistant) por teléfono
+  - conversaciones: 1 fila por cliente con estado para el dashboard
+  - leads:          oportunidades de venta capturadas por el agente
+  - pedidos:        compras concretadas (carrito confirmado)
+
+API compatible con la versión sin dashboard:
+  inicializar_db(), guardar_mensaje(), obtener_historial(), limpiar_historial()
 """
 
+import json
 import os
 from datetime import datetime
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Text, DateTime, select, Integer
+from typing import Optional
+
 from dotenv import load_dotenv
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 load_dotenv()
 
-# Configuración de base de datos
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./agentkit.db")
-
-# Si es PostgreSQL en producción, ajustar el esquema de URL
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
@@ -856,176 +883,565 @@ class Base(DeclarativeBase):
 
 
 class Mensaje(Base):
-    """Modelo de mensaje en la base de datos."""
     __tablename__ = "mensajes"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telefono: Mapped[str] = mapped_column(String(50), index=True)
-    role: Mapped[str] = mapped_column(String(20))  # "user" o "assistant"
+    role: Mapped[str] = mapped_column(String(20))  # user | assistant
     content: Mapped[str] = mapped_column(Text)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class Conversacion(Base):
+    __tablename__ = "conversaciones"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telefono: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    nombre_cliente: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    primera_actividad: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    ultima_actividad: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    total_mensajes: Mapped[int] = mapped_column(Integer, default=0)
+    intent_principal: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    # info | pedido | lead | cita | escalado | otro
+    requiere_atencion: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    atendida: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    motivo_escalacion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telefono: Mapped[str] = mapped_column(String(50), index=True)
+    nombre: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    interes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="nuevo", index=True)
+    fuente: Mapped[str] = mapped_column(String(40), default="whatsapp")
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Pedido(Base):
+    __tablename__ = "pedidos"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telefono: Mapped[str] = mapped_column(String(50), index=True)
+    items_json: Mapped[str] = mapped_column(Text)
+    total_mxn: Mapped[float] = mapped_column(Float, default=0.0)
+    direccion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    estado: Mapped[str] = mapped_column(String(20), default="pendiente", index=True)
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 async def inicializar_db():
-    """Crea las tablas si no existen."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
+# ── Mensajes (API compatible) ────────────────────────────────────────
 async def guardar_mensaje(telefono: str, role: str, content: str):
-    """Guarda un mensaje en el historial de conversación."""
-    async with async_session() as session:
-        mensaje = Mensaje(
-            telefono=telefono,
-            role=role,
-            content=content,
-            timestamp=datetime.utcnow()
-        )
-        session.add(mensaje)
-        await session.commit()
+    """Guarda mensaje y actualiza Conversacion (upsert)."""
+    ahora = datetime.utcnow()
+    async with async_session() as s:
+        s.add(Mensaje(telefono=telefono, role=role, content=content, timestamp=ahora))
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        if conv is None:
+            s.add(Conversacion(telefono=telefono, primera_actividad=ahora, ultima_actividad=ahora, total_mensajes=1))
+        else:
+            conv.ultima_actividad = ahora
+            conv.total_mensajes = (conv.total_mensajes or 0) + 1
+            if role == "user":
+                conv.atendida = False  # nuevo mensaje del cliente "reabre"
+        await s.commit()
 
 
 async def obtener_historial(telefono: str, limite: int = 20) -> list[dict]:
-    """
-    Recupera los últimos N mensajes de una conversación.
-
-    Args:
-        telefono: Número de teléfono del cliente
-        limite: Máximo de mensajes a recuperar (default: 20)
-
-    Returns:
-        Lista de diccionarios con role y content
-    """
-    async with async_session() as session:
-        query = (
-            select(Mensaje)
-            .where(Mensaje.telefono == telefono)
-            .order_by(Mensaje.timestamp.desc())
-            .limit(limite)
-        )
-        result = await session.execute(query)
-        mensajes = result.scalars().all()
-
-        # Invertir para orden cronológico (los más recientes están primero)
-        mensajes.reverse()
-
-        return [
-            {"role": msg.role, "content": msg.content}
-            for msg in mensajes
-        ]
+    async with async_session() as s:
+        rows = (await s.execute(
+            select(Mensaje).where(Mensaje.telefono == telefono)
+            .order_by(Mensaje.timestamp.desc()).limit(limite)
+        )).scalars().all()
+    msgs = list(rows); msgs.reverse()
+    return [{"role": m.role, "content": m.content} for m in msgs]
 
 
 async def limpiar_historial(telefono: str):
-    """Borra todo el historial de una conversación."""
-    async with async_session() as session:
-        query = select(Mensaje).where(Mensaje.telefono == telefono)
-        result = await session.execute(query)
-        mensajes = result.scalars().all()
-        for msg in mensajes:
-            session.delete(msg)
-        await session.commit()
+    async with async_session() as s:
+        for m in (await s.execute(select(Mensaje).where(Mensaje.telefono == telefono))).scalars().all():
+            await s.delete(m)
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        if conv: await s.delete(conv)
+        await s.commit()
+
+
+# ── Conversaciones (dashboard) ───────────────────────────────────────
+async def actualizar_conversacion(telefono: str, *, nombre_cliente=None, intent_principal=None,
+                                   requiere_atencion=None, atendida=None,
+                                   motivo_escalacion=None, notas=None):
+    async with async_session() as s:
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        if conv is None:
+            conv = Conversacion(telefono=telefono); s.add(conv)
+        for k, v in [("nombre_cliente", nombre_cliente), ("intent_principal", intent_principal),
+                     ("requiere_atencion", requiere_atencion), ("atendida", atendida),
+                     ("motivo_escalacion", motivo_escalacion), ("notas", notas)]:
+            if v is not None:
+                setattr(conv, k, v)
+        await s.commit()
+
+
+async def listar_conversaciones(*, filtro="todas", limite=200) -> list[dict]:
+    """filtro: todas | pendientes | atendidas | escaladas"""
+    async with async_session() as s:
+        q = select(Conversacion).order_by(Conversacion.ultima_actividad.desc()).limit(limite)
+        if filtro == "pendientes":
+            q = select(Conversacion).where(Conversacion.atendida == False).order_by(Conversacion.ultima_actividad.desc()).limit(limite)  # noqa
+        elif filtro == "atendidas":
+            q = select(Conversacion).where(Conversacion.atendida == True).order_by(Conversacion.ultima_actividad.desc()).limit(limite)  # noqa
+        elif filtro == "escaladas":
+            q = select(Conversacion).where(Conversacion.requiere_atencion == True).order_by(Conversacion.ultima_actividad.desc()).limit(limite)  # noqa
+        return [_conv_dict(c) for c in (await s.execute(q)).scalars().all()]
+
+
+async def obtener_conversacion(telefono: str) -> Optional[dict]:
+    async with async_session() as s:
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        return _conv_dict(conv) if conv else None
+
+
+def _conv_dict(c):
+    return {"id": c.id, "telefono": c.telefono, "nombre_cliente": c.nombre_cliente,
+            "primera_actividad": c.primera_actividad, "ultima_actividad": c.ultima_actividad,
+            "total_mensajes": c.total_mensajes, "intent_principal": c.intent_principal,
+            "requiere_atencion": c.requiere_atencion, "atendida": c.atendida,
+            "motivo_escalacion": c.motivo_escalacion, "notas": c.notas}
+
+
+# ── Leads ────────────────────────────────────────────────────────────
+async def crear_lead(telefono: str, nombre=None, interes=None, fuente="whatsapp", notas=None) -> int:
+    async with async_session() as s:
+        lead = Lead(telefono=telefono, nombre=nombre, interes=interes, fuente=fuente, notas=notas)
+        s.add(lead); await s.commit()
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        if conv and not conv.intent_principal:
+            conv.intent_principal = "lead"; await s.commit()
+        return lead.id
+
+
+async def actualizar_lead(lead_id: int, *, status=None, notas=None):
+    async with async_session() as s:
+        lead = (await s.execute(select(Lead).where(Lead.id == lead_id))).scalar_one_or_none()
+        if not lead: return
+        if status is not None: lead.status = status
+        if notas is not None: lead.notas = notas
+        await s.commit()
+
+
+async def listar_leads(*, status=None, limite=200) -> list[dict]:
+    async with async_session() as s:
+        q = select(Lead).order_by(Lead.created_at.desc()).limit(limite)
+        if status: q = select(Lead).where(Lead.status == status).order_by(Lead.created_at.desc()).limit(limite)
+        return [{"id": l.id, "telefono": l.telefono, "nombre": l.nombre, "interes": l.interes,
+                 "status": l.status, "fuente": l.fuente, "notas": l.notas,
+                 "created_at": l.created_at, "updated_at": l.updated_at}
+                for l in (await s.execute(q)).scalars().all()]
+
+
+# ── Pedidos ──────────────────────────────────────────────────────────
+async def crear_pedido(telefono: str, items: list[dict], total_mxn: float, direccion=None, notas=None) -> int:
+    async with async_session() as s:
+        p = Pedido(telefono=telefono, items_json=json.dumps(items, ensure_ascii=False),
+                   total_mxn=total_mxn, direccion=direccion, notas=notas)
+        s.add(p); await s.commit()
+        conv = (await s.execute(select(Conversacion).where(Conversacion.telefono == telefono))).scalar_one_or_none()
+        if conv:
+            conv.intent_principal = "pedido"; await s.commit()
+        return p.id
+
+
+async def actualizar_pedido(pedido_id: int, *, estado=None, notas=None):
+    async with async_session() as s:
+        p = (await s.execute(select(Pedido).where(Pedido.id == pedido_id))).scalar_one_or_none()
+        if not p: return
+        if estado is not None: p.estado = estado
+        if notas is not None: p.notas = notas
+        await s.commit()
+
+
+async def listar_pedidos(*, estado=None, limite=200) -> list[dict]:
+    async with async_session() as s:
+        q = select(Pedido).order_by(Pedido.created_at.desc()).limit(limite)
+        if estado: q = select(Pedido).where(Pedido.estado == estado).order_by(Pedido.created_at.desc()).limit(limite)
+        out = []
+        for p in (await s.execute(q)).scalars().all():
+            try: items = json.loads(p.items_json or "[]")
+            except json.JSONDecodeError: items = []
+            out.append({"id": p.id, "telefono": p.telefono, "items": items,
+                        "total_mxn": p.total_mxn, "direccion": p.direccion,
+                        "estado": p.estado, "notas": p.notas,
+                        "created_at": p.created_at, "updated_at": p.updated_at})
+        return out
+
+
+# ── KPIs para el dashboard ───────────────────────────────────────────
+async def metricas_resumen() -> dict:
+    async with async_session() as s:
+        total_conv = (await s.execute(select(func.count(Conversacion.id)))).scalar() or 0
+        pendientes = (await s.execute(select(func.count(Conversacion.id)).where(Conversacion.atendida == False))).scalar() or 0  # noqa
+        escaladas = (await s.execute(select(func.count(Conversacion.id)).where(Conversacion.requiere_atencion == True))).scalar() or 0  # noqa
+        total_leads = (await s.execute(select(func.count(Lead.id)))).scalar() or 0
+        leads_nuevos = (await s.execute(select(func.count(Lead.id)).where(Lead.status == "nuevo"))).scalar() or 0
+        total_pedidos = (await s.execute(select(func.count(Pedido.id)))).scalar() or 0
+        pedidos_pendientes = (await s.execute(select(func.count(Pedido.id)).where(Pedido.estado == "pendiente"))).scalar() or 0
+        ingresos = (await s.execute(select(func.coalesce(func.sum(Pedido.total_mxn), 0.0))
+                                    .where(Pedido.estado.in_(["confirmado", "enviado", "entregado"])))).scalar() or 0.0
+    return {"total_conversaciones": total_conv, "pendientes": pendientes, "escaladas": escaladas,
+            "total_leads": total_leads, "leads_nuevos": leads_nuevos,
+            "total_pedidos": total_pedidos, "pedidos_pendientes": pedidos_pendientes,
+            "ingresos_mxn": float(ingresos)}
 ```
 
 #### 3.7 — `agent/tools.py`
 
-Genera herramientas ESPECÍFICAS según los casos de uso elegidos por el usuario.
-Usa este template base y agrega las funciones según el caso:
+Define las **tools que Claude puede invocar** + las funciones que las ejecutan + el despachador async. Las acciones con efecto (registrar_lead, confirmar_pedido, escalar_a_humano) persisten en BD vía `agent.memory` para que el dashboard las vea.
+
+Adapta las tools al negocio del usuario. El template siguiente es para un caso e-commerce/ferretería con casos: FAQs, leads/ventas, pedidos, consultar stock. Para AGENDAR CITAS reemplaza `agregar_al_carrito`/`confirmar_pedido` por `obtener_slots_disponibles`/`reservar_cita`. Para SOPORTE agrega `crear_ticket`/`consultar_ticket`.
 
 ```python
-# agent/tools.py — Herramientas del agente
+# agent/tools.py — Tools de Claude (tool-use)
 # Generado por AgentKit
 
-"""
-Herramientas específicas del negocio.
-Estas funciones extienden las capacidades del agente más allá de responder texto.
-Claude Code genera las funciones según los casos de uso elegidos en la entrevista.
-"""
+import csv, json, logging, yaml
+from datetime import datetime, time
+from pathlib import Path
+from typing import Any
 
-import os
-import yaml
-import logging
-from datetime import datetime
+from agent import memory
 
 logger = logging.getLogger("agentkit")
 
+KNOWLEDGE_DIR = Path("knowledge")
+PRODUCTOS_JSON = KNOWLEDGE_DIR / "productos.json"
+PRODUCTOS_CSV  = KNOWLEDGE_DIR / "productos.csv"
 
+# Carrito efímero (se persiste cuando se confirma pedido)
+_CARRITOS: dict[str, list[dict]] = {}
+UMBRAL_ENVIO_GRATIS = 3500.0  # MXN — adaptar al negocio
+
+
+# ── Negocio / catálogo ─────────────────────────────────────
 def cargar_info_negocio() -> dict:
-    """Carga la información del negocio desde business.yaml."""
     try:
         with open("config/business.yaml", "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        logger.error("config/business.yaml no encontrado")
-        return {}
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError: return {}
 
 
-def obtener_horario() -> dict:
-    """Retorna el horario de atención del negocio."""
-    info = cargar_info_negocio()
-    return {
-        "horario": info.get("negocio", {}).get("horario", "No disponible"),
-        "esta_abierto": True,  # TODO: calcular según hora actual y horario
-    }
-
-
-def buscar_en_knowledge(consulta: str) -> str:
-    """
-    Busca información relevante en los archivos de /knowledge.
-    Retorna el contenido más relevante encontrado.
-    """
-    resultados = []
-    knowledge_dir = "knowledge"
-
-    if not os.path.exists(knowledge_dir):
-        return "No hay archivos de conocimiento disponibles."
-
-    for archivo in os.listdir(knowledge_dir):
-        ruta = os.path.join(knowledge_dir, archivo)
-        if archivo.startswith(".") or not os.path.isfile(ruta):
-            continue
+def _cargar_productos() -> list[dict]:
+    if PRODUCTOS_JSON.exists():
         try:
-            with open(ruta, "r", encoding="utf-8") as f:
-                contenido = f.read()
-                # Búsqueda simple por coincidencia de texto
-                if consulta.lower() in contenido.lower():
-                    resultados.append(f"[{archivo}]: {contenido[:500]}")
-        except (UnicodeDecodeError, IOError):
-            continue
+            with open(PRODUCTOS_JSON, "r", encoding="utf-8") as f:
+                return json.load(f).get("productos", [])
+        except (json.JSONDecodeError, OSError): pass
+    if PRODUCTOS_CSV.exists():
+        try:
+            with open(PRODUCTOS_CSV, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                out = []
+                for row in reader:
+                    row["precio_mxn"] = float(row.get("precio_mxn") or 0)
+                    row["stock"] = int(row.get("stock") or 0)
+                    out.append(row)
+                return out
+        except (csv.Error, OSError): pass
+    return []
 
-    if resultados:
-        return "\n---\n".join(resultados)
-    return "No encontré información específica sobre eso en mis archivos."
+
+def buscar_producto(consulta: str, limite: int = 5) -> list[dict]:
+    consulta = (consulta or "").strip().lower()
+    if not consulta: return []
+    productos = _cargar_productos()
+    out = []
+    for p in productos:
+        campos = " ".join(str(p.get(k, "")) for k in ("codigo", "nombre", "marca", "categoria"))
+        if consulta in campos.lower():
+            out.append(p)
+            if len(out) >= limite: break
+    return out
 
 
-# ════════════════════════════════════════════════════════════
-# Claude Code: agrega aquí las funciones específicas según
-# el caso de uso elegido por el usuario. Ejemplos:
-#
-# Si FAQ → buscar_en_knowledge() ya está listo arriba
-#
-# Si AGENDAR CITAS:
-# def obtener_slots_disponibles(fecha: str) -> list[dict]: ...
-# def reservar_cita(telefono, fecha, hora, servicio): ...
-# def cancelar_cita(telefono, cita_id): ...
-#
-# Si TOMAR PEDIDOS:
-# def agregar_al_carrito(telefono, producto, cantidad): ...
-# def ver_carrito(telefono) -> list[dict]: ...
-# def confirmar_pedido(telefono) -> dict: ...
-#
-# Si VENTAS / LEADS:
-# def registrar_lead(telefono, nombre, interes): ...
-# def calificar_lead(telefono) -> str: ...
-# def escalar_a_vendedor(telefono, contexto): ...
-#
-# Si SOPORTE:
-# def crear_ticket(telefono, problema) -> str: ...
-# def consultar_ticket(ticket_id) -> dict: ...
-# def escalar_ticket(ticket_id, razon): ...
-# ════════════════════════════════════════════════════════════
+def consultar_stock(consulta: str) -> dict:
+    res = buscar_producto(consulta, limite=1)
+    if not res: return {"encontrado": False, "stock": 0, "producto": None}
+    p = res[0]
+    return {"encontrado": True, "stock": int(p.get("stock", 0)), "producto": p}
+
+
+# ── Carrito ────────────────────────────────────────────────
+def _total(tel: str) -> float:
+    return sum(it["subtotal"] for it in _CARRITOS.get(tel, []))
+
+
+def agregar_al_carrito(telefono: str, codigo_o_nombre: str, cantidad: int = 1) -> dict:
+    res = buscar_producto(codigo_o_nombre, limite=1)
+    if not res: return {"ok": False, "mensaje": f"No encontré '{codigo_o_nombre}'."}
+    p = res[0]
+    stock = int(p.get("stock", 0))
+    if cantidad > stock:
+        return {"ok": False, "mensaje": f"Solo hay {stock} {p.get('unidad','pieza')}(s)."}
+    item = {"codigo": p.get("codigo"), "nombre": p.get("nombre"), "marca": p.get("marca"),
+            "precio_mxn": float(p.get("precio_mxn", 0)), "cantidad": cantidad,
+            "subtotal": float(p.get("precio_mxn", 0)) * cantidad}
+    _CARRITOS.setdefault(telefono, []).append(item)
+    return {"ok": True, "item": item, "total_actual": _total(telefono)}
+
+
+def ver_carrito(telefono: str) -> dict:
+    total = _total(telefono)
+    return {"items": _CARRITOS.get(telefono, []), "total_mxn": total,
+            "envio_gratis": total >= UMBRAL_ENVIO_GRATIS,
+            "falta_para_envio_gratis": max(0.0, UMBRAL_ENVIO_GRATIS - total)}
+
+
+async def confirmar_pedido(telefono: str, direccion_envio: str = "") -> dict:
+    items = _CARRITOS.get(telefono, [])
+    if not items: return {"ok": False, "mensaje": "El carrito está vacío."}
+    total = _total(telefono)
+    pedido_id = await memory.crear_pedido(telefono=telefono, items=items,
+                                          total_mxn=total, direccion=direccion_envio)
+    _CARRITOS.pop(telefono, None)
+    return {"ok": True, "pedido_id": pedido_id, "items": items, "total_mxn": total,
+            "direccion": direccion_envio, "timestamp": datetime.now().isoformat()}
+
+
+# ── Leads / escalación (persisten en BD) ──────────────────
+async def registrar_lead(telefono: str, nombre: str = "", interes: str = "") -> dict:
+    lead_id = await memory.crear_lead(telefono=telefono, nombre=nombre or None, interes=interes or None)
+    return {"ok": True, "lead_id": lead_id, "telefono": telefono, "nombre": nombre, "interes": interes}
+
+
+async def escalar_a_humano(telefono: str, motivo: str) -> dict:
+    await memory.actualizar_conversacion(telefono=telefono, requiere_atencion=True,
+                                         motivo_escalacion=motivo, intent_principal="escalado")
+    return {"ok": True, "mensaje": "Listo, un asesor te contactará en breve."}
+
+
+# ── Tool schemas para Claude ───────────────────────────────
+TOOLS: list[dict] = [
+    {
+        "name": "consultar_stock",
+        "description": "Consulta stock y precio de un producto por código o nombre.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"consulta": {"type": "string", "description": "Código o nombre del producto."}},
+            "required": ["consulta"],
+        },
+    },
+    {
+        "name": "agregar_al_carrito",
+        "description": "Agrega un producto al carrito del cliente. Úsala solo si el cliente confirma compra.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "codigo_o_nombre": {"type": "string"},
+                "cantidad": {"type": "integer", "default": 1, "minimum": 1},
+            },
+            "required": ["codigo_o_nombre"],
+        },
+    },
+    {"name": "ver_carrito",
+     "description": "Muestra el carrito y totales. Sin argumentos.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {
+        "name": "confirmar_pedido",
+        "description": "Cierra el pedido y lo registra. Pide la dirección de envío antes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"direccion_envio": {"type": "string"}},
+            "required": ["direccion_envio"],
+        },
+    },
+    {
+        "name": "registrar_lead",
+        "description": "Registra al cliente como lead/oportunidad cuando muestra interés pero no compra aún.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"nombre": {"type": "string"}, "interes": {"type": "string"}},
+            "required": ["interes"],
+        },
+    },
+    {
+        "name": "escalar_a_humano",
+        "description": "Cuando el cliente pide hablar con alguien, está enojado, hace queja, o no puedes resolverlo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"motivo": {"type": "string"}},
+            "required": ["motivo"],
+        },
+    },
+]
+
+
+async def ejecutar_tool(name: str, input_data: dict, telefono: str) -> Any:
+    """Despachador. telefono se inyecta desde el contexto del webhook."""
+    try:
+        if name == "consultar_stock":   return consultar_stock(input_data.get("consulta", ""))
+        if name == "agregar_al_carrito":return agregar_al_carrito(telefono,
+                                                input_data.get("codigo_o_nombre", ""),
+                                                int(input_data.get("cantidad", 1)))
+        if name == "ver_carrito":       return ver_carrito(telefono)
+        if name == "confirmar_pedido":  return await confirmar_pedido(telefono, input_data.get("direccion_envio", ""))
+        if name == "registrar_lead":    return await registrar_lead(telefono,
+                                                input_data.get("nombre", ""),
+                                                input_data.get("interes", ""))
+        if name == "escalar_a_humano":  return await escalar_a_humano(telefono, input_data.get("motivo", ""))
+        return {"ok": False, "error": f"Tool desconocida: {name}"}
+    except Exception as e:
+        logger.error(f"Error ejecutando tool {name}: {e}", exc_info=True)
+        return {"ok": False, "error": str(e)}
 ```
 
 Siempre incluir un archivo `agent/__init__.py` vacío.
+
+#### 3.7.b — `agent/dashboard/` — Dashboard de gestión
+
+Módulo nuevo. Cuatro archivos + cinco templates Jinja2. Lo monta `main.py` con `app.include_router(dashboard_router)`.
+
+**`agent/dashboard/__init__.py`:**
+
+```python
+"""Dashboard del agente AgentKit."""
+from agent.dashboard.routes import router as dashboard_router
+__all__ = ["dashboard_router"]
+```
+
+**`agent/dashboard/auth.py`** — HTTP Basic Auth con credenciales en .env:
+
+```python
+import os, secrets
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+security = HTTPBasic()
+
+
+def requerir_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    user_esperado = os.getenv("DASHBOARD_USER", "admin")
+    pwd_esperado = os.getenv("DASHBOARD_PASSWORD", "")
+    if not pwd_esperado:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dashboard sin contraseña. Define DASHBOARD_USER y DASHBOARD_PASSWORD en .env")
+    ok_u = secrets.compare_digest(credentials.username.encode(), user_esperado.encode())
+    ok_p = secrets.compare_digest(credentials.password.encode(), pwd_esperado.encode())
+    if not (ok_u and ok_p):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+```
+
+**`agent/dashboard/routes.py`** — endpoints (inbox, conversación, leads, pedidos):
+
+```python
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Form, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+from agent import memory
+from agent.dashboard.auth import requerir_auth
+
+router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+def _fmt_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+templates.env.filters["fmt_dt"] = _fmt_dt
+
+
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+async def inbox(request: Request, filtro: str = Query("todas"), _u: str = Depends(requerir_auth)):
+    return templates.TemplateResponse(request=request, name="inbox.html", context={
+        "conversaciones": await memory.listar_conversaciones(filtro=filtro),
+        "metricas": await memory.metricas_resumen(),
+        "filtro": filtro, "active": "inbox",
+    })
+
+
+@router.get("/conversacion/{telefono}", response_class=HTMLResponse)
+async def detalle_conversacion(request: Request, telefono: str, _u: str = Depends(requerir_auth)):
+    return templates.TemplateResponse(request=request, name="conversacion.html", context={
+        "telefono": telefono,
+        "conversacion": await memory.obtener_conversacion(telefono),
+        "mensajes": await memory.obtener_historial(telefono, limite=200),
+        "active": "inbox",
+    })
+
+
+@router.post("/conversacion/{telefono}/marcar")
+async def marcar_conversacion(telefono: str,
+        atendida: Optional[str] = Form(None), requiere_atencion: Optional[str] = Form(None),
+        nombre_cliente: Optional[str] = Form(None), notas: Optional[str] = Form(None),
+        _u: str = Depends(requerir_auth)):
+    await memory.actualizar_conversacion(telefono=telefono,
+        atendida=(atendida == "true") if atendida is not None else None,
+        requiere_atencion=(requiere_atencion == "true") if requiere_atencion is not None else None,
+        nombre_cliente=nombre_cliente or None, notas=notas or None)
+    return RedirectResponse(url=f"/dashboard/conversacion/{telefono}", status_code=303)
+
+
+@router.post("/conversacion/{telefono}/lead")
+async def crear_lead_desde_conv(telefono: str, nombre: str = Form(""), interes: str = Form(""),
+                                 _u: str = Depends(requerir_auth)):
+    await memory.crear_lead(telefono=telefono, nombre=nombre or None, interes=interes or None)
+    return RedirectResponse(url=f"/dashboard/conversacion/{telefono}", status_code=303)
+
+
+@router.get("/leads", response_class=HTMLResponse)
+async def lista_leads(request: Request, status: Optional[str] = Query(None), _u: str = Depends(requerir_auth)):
+    return templates.TemplateResponse(request=request, name="leads.html", context={
+        "leads": await memory.listar_leads(status=status),
+        "metricas": await memory.metricas_resumen(),
+        "filtro_status": status or "todos", "active": "leads",
+    })
+
+
+@router.post("/leads/{lead_id}/status")
+async def actualizar_status_lead(lead_id: int, status: str = Form(...),
+        notas: Optional[str] = Form(None), _u: str = Depends(requerir_auth)):
+    await memory.actualizar_lead(lead_id, status=status, notas=notas or None)
+    return RedirectResponse(url="/dashboard/leads", status_code=303)
+
+
+@router.get("/pedidos", response_class=HTMLResponse)
+async def lista_pedidos(request: Request, estado: Optional[str] = Query(None), _u: str = Depends(requerir_auth)):
+    return templates.TemplateResponse(request=request, name="pedidos.html", context={
+        "pedidos": await memory.listar_pedidos(estado=estado),
+        "metricas": await memory.metricas_resumen(),
+        "filtro_estado": estado or "todos", "active": "pedidos",
+    })
+
+
+@router.post("/pedidos/{pedido_id}/estado")
+async def actualizar_estado_pedido(pedido_id: int, estado: str = Form(...),
+        notas: Optional[str] = Form(None), _u: str = Depends(requerir_auth)):
+    await memory.actualizar_pedido(pedido_id, estado=estado, notas=notas or None)
+    return RedirectResponse(url="/dashboard/pedidos", status_code=303)
+```
+
+**`agent/dashboard/templates/`** — 5 archivos HTML con Jinja2.
+- `base.html`: layout, nav, KPIs, estilos inline (no necesita assets).
+- `inbox.html`: tabla de conversaciones con filtros (todas/pendientes/atendidas/escaladas).
+- `conversacion.html`: hilo de mensajes + panel lateral con acciones (marcar atendida, crear lead, notas).
+- `leads.html`: tabla con filtro por status (nuevo/contactado/cliente/perdido) y formularios inline para cambiar status.
+- `pedidos.html`: tabla con filtro por estado y formularios inline para avanzar estado.
+
+Los templates usan **solo CSS inline** y formularios HTML estándar (POST → redirect). No requieren build de frontend ni JS adicional. Ver el repo del template para los archivos completos.
 
 #### 3.8 — `tests/test_local.py`
 
@@ -1412,4 +1828,12 @@ ENVIRONMENT=development  # development | production
 # Base de datos
 DATABASE_URL=sqlite+aiosqlite:///./agentkit.db  # local
 # DATABASE_URL=postgresql+asyncpg://...          # producción Railway
+
+# Dashboard (HTTP Basic Auth)
+# Si DASHBOARD_PASSWORD está vacío, el dashboard responde 503.
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=cambiame-por-favor
+
+# Modelo Claude (opcional, default claude-sonnet-4-5)
+# CLAUDE_MODEL=claude-sonnet-4-5
 ```

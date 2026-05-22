@@ -16,6 +16,7 @@ Tu solo respondes preguntas sobre tu negocio. Claude Code se encarga de:
 - Escribir todo el codigo
 - Configurar la conexion con WhatsApp
 - Crear un "cerebro" con IA que sabe sobre tu negocio
+- Levantar un **dashboard web** donde puedes ver cada conversacion, marcar quien fue atendido, gestionar leads y pedidos
 - Dejarlo listo para que tus clientes le escriban
 
 ---

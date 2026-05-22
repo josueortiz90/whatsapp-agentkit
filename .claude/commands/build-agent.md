@@ -5,9 +5,9 @@ Ejecuta el flujo de onboarding de AgentKit siguiendo las 5 fases EN ORDEN:
 FASE 1 — Bienvenida y verificación del entorno
 - Muestra el mensaje de bienvenida
 - Verifica Python >= 3.11
-- Crea las carpetas necesarias (agent/, agent/providers/, config/, knowledge/, tests/)
-- Genera requirements.txt e instala dependencias
-- Crea .env base
+- Crea las carpetas necesarias (agent/, agent/providers/, agent/dashboard/, agent/dashboard/templates/, config/, knowledge/, tests/)
+- Genera requirements.txt e instala dependencias (incluye jinja2 para el dashboard)
+- Crea .env base (con DASHBOARD_USER y DASHBOARD_PASSWORD)
 
 FASE 2 — Entrevista del negocio
 - Haz las 10 preguntas UNA POR UNA
@@ -21,18 +21,21 @@ FASE 3 — Generación del agente
 - Genera config/prompts.yaml con system prompt poderoso y específico
 - Si hay archivos en /knowledge, léelos e incorpóralos al prompt
 - Genera agent/providers/ con el proveedor elegido (base.py + __init__.py + adaptador)
-- Genera agent/main.py (FastAPI + webhook provider-agnostic)
-- Genera agent/brain.py (Claude API)
-- Genera agent/memory.py (SQLite + historial)
-- Genera agent/tools.py (herramientas según caso de uso)
-- Genera tests/test_local.py (simulador de chat)
+- Genera agent/main.py (FastAPI + webhook provider-agnostic + monta dashboard router)
+- Genera agent/brain.py (Claude API con tool-use loop)
+- Genera agent/memory.py (SQLite con tablas mensajes/conversaciones/leads/pedidos + KPIs)
+- Genera agent/tools.py (TOOLS + funciones + despachador async, adaptado al caso de uso)
+- Genera agent/dashboard/ (__init__.py, auth.py, routes.py + 5 templates HTML)
+- Genera tests/test_local.py (simulador de chat — pasa telefono a generar_respuesta)
 - Genera Dockerfile y docker-compose.yml
-- Configura .env con WHATSAPP_PROVIDER y las API keys del usuario
+- Configura .env con WHATSAPP_PROVIDER, API keys y DASHBOARD_USER/PASSWORD
 
 FASE 4 — Testing local
-- Ejecuta python tests/test_local.py
-- El usuario chatea con su agente en la terminal
-- Si hay ajustes, modifica prompts.yaml y repite
+- Ejecuta python tests/test_local.py — el usuario chatea con su agente en la terminal
+- Verifica que el agente use tools cuando aplica (registrar_lead, confirmar_pedido, etc.)
+- Levanta `uvicorn agent.main:app --reload --port 8000` y guía al usuario a abrir http://localhost:8000/dashboard
+- El usuario verifica que ve la conversación de prueba, leads y pedidos creados en el dashboard
+- Si hay ajustes a prompts/tools/dashboard, modificar y repetir
 - No avanza sin aprobación del usuario
 
 FASE 5 — Deploy a Railway
