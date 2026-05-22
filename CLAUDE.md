@@ -1446,6 +1446,76 @@ async def ejecutar_tool(name: str, input_data: dict, telefono: str) -> Any:
 
 Siempre incluir un archivo `agent/__init__.py` vacío.
 
+#### 3.7.c — `agent/api_client.py` + `config/api_negocio.yaml` — Integración con API externa (ERP/CMS, opcional)
+
+Si el negocio expone una API REST (ERP propio, Shopify, Tienda Nube, Google Sheets API, etc.), el agente puede consultarla en vivo durante la conversación. La integración es **híbrida**: cache en memoria con TTL por endpoint + miss → fetch.
+
+**Decisión de diseño:** cada endpoint del YAML se vuelve una tool dinámica en `TOOLS`. Claude las elige según las descripciones del YAML, no requiere modificar el system prompt.
+
+**`config/api_negocio.yaml`** — declarativo. La presencia del archivo activa las tools dinámicas; si falta, el agente sigue funcionando solo con las core.
+
+```yaml
+api:
+  base_url: "http://localhost:9001"             # mock o ERP real
+  auth:
+    type: bearer                                # bearer | api_key_header | basic | none
+    token_env: API_NEGOCIO_TOKEN                # variable de entorno con el token
+  timeout_seconds: 10
+  default_cache_ttl_seconds: 30
+
+endpoints:
+  - tool_name: api_stock_actual
+    method: GET
+    path: /productos/{codigo}/stock
+    description: Devuelve stock actual de un SKU en tiempo real desde el ERP.
+    params:
+      - { name: codigo, in: path, type: string, required: true, description: "Código SKU." }
+    cache_ttl_seconds: 15
+
+  - tool_name: api_precio_actual
+    method: GET
+    path: /precios/{codigo}
+    description: Precio actual del SKU (puede variar respecto al catálogo del prompt).
+    params:
+      - { name: codigo, in: path, type: string, required: true }
+    cache_ttl_seconds: 60
+```
+
+**`agent/api_client.py`** — cliente httpx async con cache en memoria. La función pública `consultar_api(endpoint_spec, params)` resuelve placeholders del path, agrega headers de auth, hace el request y cachea según TTL. Si las keys/config faltan, devuelve `{"ok": False, ...}` sin crashear.
+
+Variables relevantes:
+```env
+API_NEGOCIO_TOKEN=mock-erp-secret    # o el token real del ERP
+```
+
+**Integración con `agent/tools.py`** — al cargar el módulo:
+
+```python
+from agent.api_client import consultar_api, endpoints_disponibles
+
+# Después de la lista TOOLS core:
+def _registrar_tools_api() -> list[dict]:
+    tools = []
+    for ep in endpoints_disponibles():
+        _ENDPOINTS_POR_NOMBRE[ep["tool_name"]] = ep
+        tools.append(_tool_schema_desde_endpoint(ep))
+    return tools
+
+TOOLS = TOOLS + _registrar_tools_api()
+
+# En el dispatcher:
+if name in _ENDPOINTS_POR_NOMBRE:
+    return await consultar_api(_ENDPOINTS_POR_NOMBRE[name], input_data or {})
+```
+
+Genera `_tool_schema_desde_endpoint(ep)` mapeando los params del YAML a JSON Schema:
+- `in: path` → placeholder en la URL, no en query
+- `in: query` → query parameter
+- `type` → string | integer | number | boolean
+- `required` → entra al array `required` del schema
+
+**Mock para desarrollo:** carpeta `mock_erp/` con un FastAPI separado (puerto 9001) que simula los endpoints con datos de `knowledge/productos.csv`. Permite probar la integración antes de tener el ERP real. Documentado en `mock_erp/README.md`.
+
 #### 3.7.b — `agent/dashboard/` — Dashboard de gestión
 
 Módulo nuevo. Cuatro archivos + cinco templates Jinja2. Lo monta `main.py` con `app.include_router(dashboard_router)`.

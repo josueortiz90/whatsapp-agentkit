@@ -315,6 +315,7 @@ El cliente recibe la respuesta en segundos
 - 🔌 **Patron adaptador para WhatsApp** — Tres proveedores intercambiables (Whapi.cloud, Meta Cloud API, Twilio). Cambiar de proveedor es cambiar una variable de entorno.
 - 🛡️ **Ignora chats grupales por defecto** — Si el numero del agente termina dentro de un grupo de WhatsApp, los mensajes del grupo (sufijo `@g.us`) se descartan en el provider, sin gastar tokens ni ensuciar el dashboard. El agente esta pensado para atencion 1:1.
 - 📊 **Observabilidad con Langfuse (opcional)** — Cada mensaje del cliente se trazea: tokens, costo, latencia, tools invocadas, errores. Si las keys no estan configuradas, el agente sigue funcionando sin tracing (cero overhead). Free tier de 50k observaciones/mes.
+- 🔗 **Integracion con API externa del negocio (opcional)** — Si tu negocio tiene un ERP, e-commerce o CMS con API REST, el agente puede consultarlo en vivo. Tools dinamicas configurables por YAML (`config/api_negocio.yaml`), cache hibrido (TTL por endpoint + miss → fetch), auth Bearer/API Key/Basic. Trae un `mock_erp/` listo para desarrollar sin depender de un ERP real.
 - 🚀 **Deploy a Railway con un clic** — Push a GitHub → Railway lo deploya. Variables de entorno desde el panel. Webhook publico HTTPS automatico.
 
 ---
