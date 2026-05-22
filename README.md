@@ -188,16 +188,33 @@ Cuando corres `/build-agent`, Claude Code genera codigo personalizado para TU ne
    cd ../mi-negocio-agent
    git init -b main
    git remote add origin https://github.com/mi-usuario/mi-negocio-agent.git
+   # IMPORTANTE: el .gitignore del agente debe usar _[!_]*.py (no _*.py)
+   # para no excluir agent/__init__.py — ver seccion ".gitignore recomendado" abajo
    git add . && git commit -m "initial: agente generado con AgentKit"
    git push -u origin main
 
 5. Conectas TU repo privado a Railway
    railway.app → New Project → Deploy from GitHub repo → mi-negocio-agent
+   Settings → Source → GitHub Repo (asegurate de conectarlo asi, no via
+   "railway up" desde la CLI, para que cada push haga redeploy automatico)
+
+6. Variables de entorno en Railway → Settings → Variables
+   Copia las del .env.example y llenalas con tus tokens reales.
+   Si DATABASE_URL apunta a Supabase y el password tiene "+" o "@",
+   URL-encodealos como %2B y %40.
 ```
 
 ### Ejemplo real
 
-Este patron lo usa el creador del proyecto: el agente **"Viki"** para **Ferreteria Ortiz** vive en su propio repo privado, separado del template publico. El template recibe mejoras (dashboard, tool-use, GPS, factura) que se propagan a futuros agentes generados, mientras que el agente Viki tiene su propia historia de commits con cambios especificos del negocio.
+Este patron lo usa el creador del proyecto: el agente **"Viki"** para **Ferreteria Ortiz** vive en su propio repo privado, separado del template publico, y esta deployado en Railway:
+
+```
+Template publico (este repo):  github.com/josueortiz90/whatsapp-agentkit
+Repo privado del agente:        github.com/josueortiz90/ferreteria-ortiz-agent
+Deploy en Railway:              viki-agent-production.up.railway.app
+```
+
+El template recibe mejoras (dashboard, tool-use, GPS, factura, Langfuse, filtro de grupos) que se propagan a futuros agentes generados, mientras que el agente Viki tiene su propia historia de commits con cambios especificos del negocio y su propia URL publica.
 
 ### `.gitignore` recomendado para TU repo del agente
 
@@ -216,8 +233,8 @@ __pycache__/
 .venv/
 venv/
 
-# Helpers temporales
-_*.py
+# Helpers temporales (single underscore prefix, dos no — no rompe __init__.py)
+_[!_]*.py
 
 # OS / IDE
 .DS_Store
@@ -225,6 +242,10 @@ Thumbs.db
 .vscode/
 .idea/
 ```
+
+⚠️ **Atencion al patron `_[!_]*.py`** — NO uses `_*.py`. La version simple `_*.py` matchea TAMBIEN `__init__.py` (porque empieza con `_`), y sin esos archivos, Python no carga los packages `agent.dashboard` ni `agent.providers` correctamente en produccion → `/dashboard` responde 404 o el provider falla.
+
+El patron `_[!_]*.py` matchea archivos que empiezan con UN underscore seguido de algo que NO es underscore (matchea `_check.py`, `_seed.py`, `_wipe.py`), pero NO matchea archivos con doble underscore (`__init__.py`, `__main__.py`).
 
 NO incluyas en `.gitignore` las carpetas `agent/`, `config/` ni `knowledge/`: esas SI tienen que viajar al repo del agente porque son el codigo y datos que Railway va a deployear.
 
