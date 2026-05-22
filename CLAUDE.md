@@ -349,6 +349,37 @@ system_prompt: |
   [HORARIO]
   Fuera de horario responde: "Gracias por escribirnos. Nuestro horario de atención es [HORARIO]. Te responderemos en cuanto estemos disponibles."
 
+  ## Flujo de envío (incluir SOLO si el agente toma pedidos con entrega a domicilio)
+
+  Para tomar la dirección de envío NO pidas colonia ni código postal. Pide en este orden:
+
+  1) Descripción de la ubicación en texto libre: calle, número y referencias visibles
+     (color de portón, esquina, junto a qué negocio, piso si aplica).
+  2) Ubicación GPS por WhatsApp nativo (botón 📎 → Ubicación). Cuando el cliente la
+     comparta, el mensaje llegará con este formato sintético generado por el provider:
+       `[UBICACIÓN COMPARTIDA] Lat: X, Lng: Y · https://maps.google.com/?q=X,Y`
+     o `[UBICACIÓN EN VIVO] ...` si compartió ubicación en tiempo real.
+
+  Cuando tengas AMBAS piezas, llama a `confirmar_pedido` con `direccion_envio` =
+  un único string que combine descripción + GPS, por ejemplo:
+    "Av 15 #2, portón azul · GPS: https://maps.google.com/?q=19.43,-99.13"
+
+  Si el cliente intenta dar colonia + CP en lugar de GPS, pídele igualmente que comparta
+  su ubicación con 📎 → Ubicación porque el repartidor necesita las coordenadas exactas.
+  Como última opción acepta un link de Google Maps pegado como texto.
+
+  ## Flujo de factura digital (incluir SOLO si el agente emite facturas)
+
+  Si el cliente pide factura, recolecta los TRES datos y llama `registrar_datos_factura`:
+  1) NIT (o RFC) — identificación tributaria.
+  2) Nombre o razón social que va impresa en la factura.
+  3) Correo electrónico (validar formato `texto@dominio.ext`) para la factura digital.
+
+  Pídelos en un solo mensaje con lista numerada. No llames la tool hasta tener los TRES.
+  La tool actualiza el ÚLTIMO pedido del cliente, así que se pide normalmente tras
+  `confirmar_pedido`. Si el cliente la pide antes y no hay pedido, guarda los datos
+  en tu memoria y aplícalos justo después de cerrar el pedido.
+
   ## Reglas de comportamiento
   - SIEMPRE responde en español
   - Sé [TONO] en cada mensaje
@@ -465,13 +496,35 @@ class ProveedorWhapi(ProveedorWhatsApp):
         self.url_envio = "https://gate.whapi.cloud/messages/text"
 
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
-        """Parsea el payload de Whapi.cloud."""
+        """Parsea el payload de Whapi.cloud.
+
+        Soporta texto plano y mensajes tipo `location`/`live_location`. Cuando llega
+        ubicación, se sintetiza un string que Claude puede leer sin campos extra:
+            [UBICACIÓN COMPARTIDA] Lat: X, Lng: Y · https://maps.google.com/?q=X,Y
+        """
         body = await request.json()
         mensajes = []
         for msg in body.get("messages", []):
+            tipo = (msg.get("type") or "").lower()
+            texto = ""
+            if isinstance(msg.get("text"), dict):
+                texto = msg["text"].get("body", "") or ""
+
+            loc = msg.get("location") or msg.get("live_location")
+            if loc and isinstance(loc, dict):
+                lat, lng = loc.get("latitude"), loc.get("longitude")
+                if lat is not None and lng is not None:
+                    extras = []
+                    if loc.get("name"):    extras.append(f"lugar: {loc['name']}")
+                    if loc.get("address"): extras.append(f"dirección aproximada: {loc['address']}")
+                    extras_txt = (" · " + " · ".join(extras)) if extras else ""
+                    marcador = "UBICACIÓN EN VIVO" if tipo == "live_location" else "UBICACIÓN COMPARTIDA"
+                    texto = (f"[{marcador}] Lat: {lat}, Lng: {lng}"
+                             f" · https://maps.google.com/?q={lat},{lng}{extras_txt}")
+
             mensajes.append(MensajeEntrante(
                 telefono=msg.get("chat_id", ""),
-                texto=msg.get("text", {}).get("body", ""),
+                texto=texto,
                 mensaje_id=msg.get("id", ""),
                 es_propio=msg.get("from_me", False),
             ))
@@ -929,6 +982,10 @@ class Pedido(Base):
     direccion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     estado: Mapped[str] = mapped_column(String(20), default="pendiente", index=True)
     notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Datos opcionales para emitir factura digital — los rellena la tool registrar_datos_factura
+    factura_nit: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    factura_nombre: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    factura_email: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1068,6 +1125,17 @@ async def actualizar_pedido(pedido_id: int, *, estado=None, notas=None):
         await s.commit()
 
 
+async def actualizar_factura_ultimo_pedido(telefono: str, *, nit: str, nombre: str, email: str) -> Optional[int]:
+    """Asigna datos de factura al último pedido del cliente. Retorna pedido_id o None."""
+    async with async_session() as s:
+        p = (await s.execute(select(Pedido).where(Pedido.telefono == telefono)
+                              .order_by(Pedido.created_at.desc()).limit(1))).scalar_one_or_none()
+        if p is None: return None
+        p.factura_nit, p.factura_nombre, p.factura_email = nit, nombre, email
+        await s.commit()
+        return p.id
+
+
 async def listar_pedidos(*, estado=None, limite=200) -> list[dict]:
     async with async_session() as s:
         q = select(Pedido).order_by(Pedido.created_at.desc()).limit(limite)
@@ -1079,6 +1147,8 @@ async def listar_pedidos(*, estado=None, limite=200) -> list[dict]:
             out.append({"id": p.id, "telefono": p.telefono, "items": items,
                         "total_mxn": p.total_mxn, "direccion": p.direccion,
                         "estado": p.estado, "notas": p.notas,
+                        "factura_nit": p.factura_nit, "factura_nombre": p.factura_nombre,
+                        "factura_email": p.factura_email,
                         "created_at": p.created_at, "updated_at": p.updated_at})
         return out
 
@@ -1226,6 +1296,25 @@ async def escalar_a_humano(telefono: str, motivo: str) -> dict:
     return {"ok": True, "mensaje": "Listo, un asesor te contactará en breve."}
 
 
+import re as _re
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+async def registrar_datos_factura(telefono: str, nit: str, nombre: str, email: str) -> dict:
+    """Persiste NIT/Nombre/Email en el ÚLTIMO pedido del cliente para emitir factura digital."""
+    nit, nombre, email = (nit or "").strip(), (nombre or "").strip(), (email or "").strip()
+    if not nit or not nombre or not email:
+        return {"ok": False, "mensaje": "Faltan datos: necesito NIT, nombre y correo."}
+    if not _EMAIL_RE.match(email):
+        return {"ok": False, "mensaje": f"El correo '{email}' no parece válido."}
+    pedido_id = await memory.actualizar_factura_ultimo_pedido(
+        telefono=telefono, nit=nit, nombre=nombre, email=email,
+    )
+    if pedido_id is None:
+        return {"ok": False, "mensaje": "No encontré un pedido reciente para asociar la factura."}
+    return {"ok": True, "pedido_id": pedido_id, "nit": nit, "nombre": nombre, "email": email}
+
+
 # ── Tool schemas para Claude ───────────────────────────────
 TOOLS: list[dict] = [
     {
@@ -1279,6 +1368,23 @@ TOOLS: list[dict] = [
             "required": ["motivo"],
         },
     },
+    {
+        "name": "registrar_datos_factura",
+        "description": (
+            "Persiste datos de facturación (NIT, nombre, email) en el último pedido del cliente. "
+            "Úsala SOLO cuando ya tengas los tres datos. Si falta alguno o el email es inválido, "
+            "pídelo primero al cliente y no llames la tool todavía."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nit":    {"type": "string"},
+                "nombre": {"type": "string"},
+                "email":  {"type": "string"},
+            },
+            "required": ["nit", "nombre", "email"],
+        },
+    },
 ]
 
 
@@ -1295,6 +1401,11 @@ async def ejecutar_tool(name: str, input_data: dict, telefono: str) -> Any:
                                                 input_data.get("nombre", ""),
                                                 input_data.get("interes", ""))
         if name == "escalar_a_humano":  return await escalar_a_humano(telefono, input_data.get("motivo", ""))
+        if name == "registrar_datos_factura":
+            return await registrar_datos_factura(telefono,
+                                                 input_data.get("nit", ""),
+                                                 input_data.get("nombre", ""),
+                                                 input_data.get("email", ""))
         return {"ok": False, "error": f"Tool desconocida: {name}"}
     except Exception as e:
         logger.error(f"Error ejecutando tool {name}: {e}", exc_info=True)
