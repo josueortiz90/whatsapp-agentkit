@@ -20,6 +20,8 @@ Tu solo respondes preguntas sobre tu negocio. Claude Code se encarga de:
 - Persistir todo en una **base de datos real** (SQLite local o PostgreSQL/Supabase en produccion): mensajes, conversaciones, leads, pedidos y facturas
 - Dejarlo listo para que tus clientes le escriban
 
+> 📚 **Modelo de dos repos:** este repositorio es el **template** que lee Claude Code. Cuando `/build-agent` genere el codigo de TU agente, ese codigo va a un repo **separado y privado** (lo creas tu). El template se mantiene publico y reutilizable; tu agente con datos del negocio queda privado. Lee la seccion ["Como organizar tus repos"](#como-organizar-tus-repos-template-vs-agente-generado) para el detalle.
+
 ---
 
 ## Como funciona? (El flujo completo)
@@ -134,14 +136,97 @@ Si algo no te gusta, le dices a Claude Code y lo ajusta al momento.
 Cuando estes satisfecho con tu agente, Claude Code te guia para ponerlo en linea:
 
 1. **Claude Code prepara tu proyecto** para produccion (ajusta configuracion)
-2. **Tu lo subes a GitHub** — Claude Code te da los comandos exactos para crear tu repo
-3. **Conectas Railway** — entras a [railway.app](https://railway.app), le das tu repo de GitHub y Railway lo deployea automaticamente
+2. **Creas un repo NUEVO (privado) para TU agente** — Claude Code te da los comandos. **Importante:** NO subes los archivos a este repo (`whatsapp-agentkit`). Tu agente vive en su propio repo, generalmente privado, porque incluye tu catalogo, prompts y datos del negocio. Lee la siguiente seccion ("Como organizar tus repos") para el detalle.
+3. **Conectas Railway** — entras a [railway.app](https://railway.app), le das TU repo privado y Railway lo deployea automaticamente
 4. **Configuras las variables** — Claude Code te dice exactamente cuales poner en Railway (las mismas API keys de tu .env)
 5. **Configuras el webhook** — Claude Code te guia para conectar tu proveedor de WhatsApp con la URL de Railway
 
 Despues de esto, cualquier persona que te escriba por WhatsApp sera atendida por tu agente.
 
 **Nota:** No necesitas saber de servidores ni de deploy. Claude Code te dice cada paso, que escribir y donde hacer click.
+
+---
+
+## Como organizar tus repos: template vs agente generado
+
+Este proyecto trabaja con **dos repositorios distintos**:
+
+| | Template (este repo) | Tu agente |
+|---|---|---|
+| **URL** | `josueortiz90/whatsapp-agentkit` (publico) | `tu-usuario/mi-negocio-agent` (privado, lo creas tu) |
+| **Que contiene** | `CLAUDE.md`, `.skill/build-agent`, `README.md`, `start.sh`, `.env.example` | `agent/`, `config/`, `knowledge/`, `tests/`, `Dockerfile`, `requirements.txt`, `.env.example` |
+| **Para que sirve** | Instrucciones que lee Claude Code para CONSTRUIR agentes | El codigo YA GENERADO de tu agente especifico, listo para deploy |
+| **Privacidad** | Publico — sirve a otros usuarios de AgentKit | Privado — tiene el catalogo, prompts y datos de tu negocio |
+| **Conectado a Railway** | No | Si — Railway deploya desde aqui |
+
+### Por que dos repos?
+
+Cuando corres `/build-agent`, Claude Code genera codigo personalizado para TU negocio: tu catalogo, tu tono, tu knowledge base, tus tools. Ese codigo es **tuyo**, no de AgentKit. Por eso:
+
+- Mantenerlo en un repo separado evita que tus prompts y datos del negocio terminen en un repo publico.
+- El template puede actualizarse (mejoras, fixes) sin afectar agentes que ya estan en produccion.
+- Si tienes varios agentes (uno por negocio), cada uno vive en su propio repo y se deploya independientemente.
+
+### Como funciona en la practica
+
+```
+1. Clonas el TEMPLATE (este repo)
+   git clone https://github.com/josueortiz90/whatsapp-agentkit.git
+   cd whatsapp-agentkit
+
+2. Corres /build-agent en Claude Code
+   Esto GENERA archivos en agent/, config/, knowledge/, tests/, etc.
+   El .gitignore de este repo IGNORA esos archivos para no contaminar el template.
+
+3. Cuando estas listo para deploy, creas TU repo privado:
+   gh repo create mi-usuario/mi-negocio-agent --private
+   #  o crealo manualmente en github.com
+
+4. Copias los archivos generados a una nueva carpeta y los subes a TU repo:
+   cp -r agent config knowledge tests requirements.txt Dockerfile \
+        docker-compose.yml .env.example ../mi-negocio-agent/
+   cd ../mi-negocio-agent
+   git init -b main
+   git remote add origin https://github.com/mi-usuario/mi-negocio-agent.git
+   git add . && git commit -m "initial: agente generado con AgentKit"
+   git push -u origin main
+
+5. Conectas TU repo privado a Railway
+   railway.app → New Project → Deploy from GitHub repo → mi-negocio-agent
+```
+
+### Ejemplo real
+
+Este patron lo usa el creador del proyecto: el agente **"Viki"** para **Ferreteria Ortiz** vive en su propio repo privado, separado del template publico. El template recibe mejoras (dashboard, tool-use, GPS, factura) que se propagan a futuros agentes generados, mientras que el agente Viki tiene su propia historia de commits con cambios especificos del negocio.
+
+### `.gitignore` recomendado para TU repo del agente
+
+```gitignore
+# Secretos
+.env
+.env.local
+
+# Bases de datos locales (en produccion uses Supabase/Railway)
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Helpers temporales
+_*.py
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+```
+
+NO incluyas en `.gitignore` las carpetas `agent/`, `config/` ni `knowledge/`: esas SI tienen que viajar al repo del agente porque son el codigo y datos que Railway va a deployear.
 
 ---
 
