@@ -14,9 +14,10 @@ para generar un agente de WhatsApp completo y personalizado para tu negocio.
 
 Tu solo respondes preguntas sobre tu negocio. Claude Code se encarga de:
 - Escribir todo el codigo
-- Configurar la conexion con WhatsApp
-- Crear un "cerebro" con IA que sabe sobre tu negocio
-- Levantar un **dashboard web** donde puedes ver cada conversacion, marcar quien fue atendido, gestionar leads y pedidos
+- Configurar la conexion con WhatsApp (incluyendo soporte para **ubicacion GPS nativa**)
+- Crear un "cerebro" con IA que usa **tool-use loop** (puede consultar stock, agregar al carrito, cerrar pedidos, registrar leads, escalar a un humano)
+- Levantar un **dashboard web** donde puedes ver cada conversacion, marcar quien fue atendido, gestionar leads, pedidos y datos de facturacion
+- Persistir todo en una **base de datos real** (SQLite local o PostgreSQL/Supabase en produccion): mensajes, conversaciones, leads, pedidos y facturas
 - Dejarlo listo para que tus clientes le escriban
 
 ---
@@ -79,21 +80,29 @@ Con tus respuestas, genera automaticamente estos archivos:
 ```
 tu-proyecto/
 ├── agent/                     ← EL AGENTE COMPLETO
-│   ├── main.py                Servidor web que recibe mensajes de WhatsApp
-│   ├── brain.py               Conexion con Claude AI (el cerebro)
-│   ├── memory.py              Guarda el historial de cada cliente
-│   ├── tools.py               Herramientas especificas de tu negocio
-│   └── providers/             Conexion con tu servicio de WhatsApp
-│       ├── base.py            Interfaz comun
-│       ├── __init__.py        Selecciona el proveedor automaticamente
-│       └── whapi.py           Adaptador (o meta.py, o twilio.py)
+│   ├── main.py                Servidor FastAPI: webhook + monta el dashboard
+│   ├── brain.py               Cerebro con tool-use loop de Claude
+│   ├── memory.py              SQLAlchemy: mensajes, conversaciones, leads, pedidos, KPIs
+│   ├── tools.py               Tools que Claude puede invocar: consultar_stock,
+│   │                          agregar_al_carrito, confirmar_pedido, registrar_lead,
+│   │                          escalar_a_humano, registrar_datos_factura
+│   ├── providers/             Conexion con tu servicio de WhatsApp
+│   │   ├── base.py            Interfaz comun (parsear_webhook / enviar_mensaje)
+│   │   ├── __init__.py        Selecciona el proveedor desde .env
+│   │   └── whapi.py           Adaptador (o meta.py / twilio.py). Parsea
+│   │                          mensajes de texto Y ubicacion GPS nativa.
+│   └── dashboard/             ← DASHBOARD DE GESTION (HTTP Basic Auth)
+│       ├── auth.py            Login con DASHBOARD_USER / DASHBOARD_PASSWORD
+│       ├── routes.py          /dashboard, /dashboard/leads, /dashboard/pedidos
+│       └── templates/         Jinja2: inbox, conversacion, leads, pedidos
 │
 ├── config/                    ← CONFIGURACION
 │   ├── business.yaml          Datos de tu negocio
 │   └── prompts.yaml           El "prompt" que define la personalidad del agente
+│                              (incluye flujos de envio GPS y facturacion)
 │
 ├── knowledge/                 ← TUS ARCHIVOS
-│   └── (menu.pdf, precios.txt, etc.)
+│   └── (menu.pdf, precios.txt, productos.csv, etc.)
 │
 ├── tests/
 │   └── test_local.py          Simulador de chat en tu terminal
@@ -101,7 +110,7 @@ tu-proyecto/
 ├── requirements.txt           Dependencias de Python
 ├── Dockerfile                 Para produccion
 ├── docker-compose.yml         Orquestacion
-└── .env                       Tus API keys (seguro, nunca se sube)
+└── .env                       Tus API keys + DASHBOARD_USER/PASSWORD (nunca se sube)
 ```
 
 ### Paso 5: Pruebas tu agente en la terminal (5 minutos)
@@ -139,7 +148,7 @@ Despues de esto, cualquier persona que te escriba por WhatsApp sera atendida por
 ## Como funciona el agente ya en produccion?
 
 ```
-Un cliente escribe "Hola" por WhatsApp
+Un cliente escribe "Hola, quiero un martillo" por WhatsApp
          |
          v
 Tu proveedor de WhatsApp (Whapi/Meta/Twilio) recibe el mensaje
@@ -148,31 +157,56 @@ Tu proveedor de WhatsApp (Whapi/Meta/Twilio) recibe el mensaje
 Envia el mensaje a tu servidor en Railway via webhook
          |
          v
-agent/providers/ → Normaliza el mensaje (cada proveedor tiene formato diferente)
+agent/providers/ → Normaliza el mensaje. Si el cliente comparte ubicacion
+                   GPS (boton nativo de WhatsApp), se convierte en texto:
+                   "[UBICACION COMPARTIDA] Lat: X, Lng: Y · maps link"
          |
          v
-agent/memory.py → Busca el historial de ESE cliente (por numero de telefono)
+agent/memory.py → Busca el historial de ESE cliente y registra el mensaje
+                  nuevo (tablas: mensajes + conversaciones)
          |
          v
-agent/brain.py → Envia a Claude AI:
-                 - El system prompt (personalidad + info de tu negocio)
-                 - El historial de la conversacion
-                 - El mensaje nuevo del cliente
-         |
-         v
-Claude AI genera una respuesta inteligente
+agent/brain.py → Tool-use loop con Claude:
+                 1. Envia system prompt + historial + tools disponibles
+                 2. Si Claude pide una tool (ej. agregar_al_carrito), se ejecuta
+                    y el resultado vuelve a Claude
+                 3. Se repite hasta que Claude genera la respuesta final
+                 4. Las acciones con efecto (pedidos, leads, factura)
+                    se persisten en la BD via agent/tools.py + agent/memory.py
          |
          v
 agent/providers/ → Envia la respuesta de vuelta por WhatsApp
          |
          v
 El cliente recibe la respuesta en segundos
+
+         ╔══════════════════════════════════════════════════════════╗
+         ║  Mientras tanto, en /dashboard (HTTP Basic Auth):        ║
+         ║    - Veo todas las conversaciones (atendidas/pendientes) ║
+         ║    - Reviso los leads capturados                         ║
+         ║    - Marco pedidos como enviados/entregados              ║
+         ║    - Reviso datos de facturacion por pedido              ║
+         ╚══════════════════════════════════════════════════════════╝
 ```
 
 **Cosas importantes:**
-- Cada cliente tiene su propio historial. Si alguien habla contigo y vuelve al dia siguiente, el agente recuerda la conversacion anterior.
-- El agente NUNCA inventa informacion. Solo responde con lo que tu le diste.
-- Si no sabe algo, responde: "No tengo esa informacion, dejame conectarte con alguien del equipo."
+- Cada cliente tiene su propio historial. Si alguien vuelve al dia siguiente, el agente recuerda la conversacion.
+- El agente NUNCA inventa informacion. Solo responde con lo que tu le diste y con lo que las tools le devuelven.
+- Si no sabe algo, responde: "No tengo esa informacion, dejame conectarte con alguien del equipo." y escala via la tool `escalar_a_humano`.
+- Cuando toma un pedido, NO te pide colonia/codigo postal — te pide una **descripcion libre** del domicilio + tu **ubicacion GPS** usando el boton nativo de WhatsApp. La direccion final queda con coordenadas exactas para el repartidor.
+- Cuando pides factura, recolecta **NIT/RFC + nombre + email** (valida el formato del email) y lo asocia al ultimo pedido.
+
+---
+
+## Caracteristicas destacadas
+
+- 🛠️ **Tool-use loop con Claude** — Claude no solo responde, sino que ejecuta acciones reales: consulta stock, agrega al carrito, cierra pedidos, registra leads, escala a humanos, captura datos de factura. Todo con tope de iteraciones para evitar loops infinitos.
+- 📍 **Ubicacion GPS nativa de WhatsApp** — El cliente comparte su ubicacion con el boton 📎 → Ubicacion y la direccion del pedido queda con coordenadas exactas (mas un texto libre con referencias visibles). Cero colonia/codigo postal.
+- 🧾 **Facturacion digital integrada** — Cuando el cliente pide factura, el agente recolecta NIT/RFC, nombre y email (con validacion de formato) y los guarda asociados al ultimo pedido del cliente.
+- 📊 **Dashboard web de gestion** — `/dashboard` con HTTP Basic Auth. Inbox de conversaciones con filtros (pendientes/atendidas/escaladas), CRM de leads (nuevo/contactado/cliente/perdido), gestion de pedidos (pendiente/confirmado/enviado/entregado/cancelado) y KPIs agregados (ingresos confirmados, conversaciones pendientes, etc.).
+- 💾 **Persistencia real** — SQLAlchemy async con SQLite (dev) o PostgreSQL/Supabase (prod). Cuatro tablas: `mensajes`, `conversaciones`, `leads`, `pedidos` (con columnas `factura_nit/nombre/email`).
+- 🔌 **Patron adaptador para WhatsApp** — Tres proveedores intercambiables (Whapi.cloud, Meta Cloud API, Twilio). Cambiar de proveedor es cambiar una variable de entorno.
+- 🚀 **Deploy a Railway con un clic** — Push a GitHub → Railway lo deploya. Variables de entorno desde el panel. Webhook publico HTTPS automatico.
 
 ---
 
@@ -278,8 +312,18 @@ AgentKit soporta 3 proveedores. Tu eliges cual usar durante el setup.
 # Probar el agente sin WhatsApp (chat en terminal)
 python tests/test_local.py
 
-# Arrancar el servidor localmente
+# Arrancar el servidor localmente (webhook + dashboard)
 uvicorn agent.main:app --reload --port 8000
+
+# Abrir el dashboard
+# → http://localhost:8000/dashboard
+#   Usuario / contrasena: DASHBOARD_USER / DASHBOARD_PASSWORD (tu .env)
+
+# Probar el webhook con WhatsApp real desde tu maquina (tunel publico):
+#   Mac/Linux:    cloudflared tunnel --url http://localhost:8000
+#   Windows:      winget install Cloudflare.cloudflared
+#                 cloudflared tunnel --url http://localhost:8000
+# Apunta el webhook de tu proveedor a la URL https://...trycloudflare.com/webhook
 
 # Build Docker para produccion
 docker compose up --build
@@ -316,37 +360,55 @@ Para los curiosos, esto es lo que se usa por debajo:
 
 | Componente | Tecnologia | Para que sirve |
 |-----------|-----------|----------------|
-| IA | Claude AI (claude-sonnet-4-6) | Genera las respuestas inteligentes |
-| Servidor | FastAPI + Uvicorn | Recibe los webhooks de WhatsApp |
-| WhatsApp | Whapi.cloud / Meta / Twilio | Conecta con WhatsApp (tu eliges) |
-| Base de datos | SQLite (local) / PostgreSQL (prod) | Guarda historial de conversaciones |
-| Deploy | Docker + Railway | Pone tu agente en internet |
-| Config | python-dotenv + YAML | Maneja API keys y configuracion |
+| IA | Claude (claude-sonnet-4-5) con **tool-use loop** | Cerebro: razona, ejecuta acciones, persiste resultados |
+| Servidor | FastAPI + Uvicorn | Recibe webhooks de WhatsApp y sirve el dashboard |
+| WhatsApp | Whapi.cloud / Meta / Twilio | Conecta con WhatsApp (tu eliges). Whapi parsea ubicacion GPS nativa. |
+| Base de datos | SQLite (local) o PostgreSQL/Supabase (prod) con SQLAlchemy async | Mensajes, conversaciones, leads, pedidos, datos de factura |
+| Dashboard | Jinja2 server-side + HTTP Basic Auth | Inbox, gestion de leads y pedidos, KPIs |
+| Deploy | Docker + Railway | Pone tu agente en internet con un click |
+| Config | python-dotenv + YAML | API keys + personalidad del agente |
 
 ---
 
 ## Arquitectura (para desarrolladores)
 
 ```
-WhatsApp (cliente)
-    |
-    v
-Proveedor (Whapi/Meta/Twilio) ←→ agent/providers/ (normaliza formato)
-    |
-    v
-FastAPI (agent/main.py) ←→ agent/memory.py (historial SQLite)
-    |
-    v
-Claude API (agent/brain.py) ←→ config/prompts.yaml (personalidad)
-    |
-    v
+                      WhatsApp (cliente)
+                            |
+                            v
+Proveedor (Whapi/Meta/Twilio) ←→ agent/providers/ (normaliza texto + GPS)
+                            |
+                            v
+        FastAPI (agent/main.py) ←→ agent/memory.py (SQLAlchemy async)
+              |                          |
+              |                          ├── tabla mensajes
+              |                          ├── tabla conversaciones
+              |                          ├── tabla leads
+              |                          └── tabla pedidos (+ factura_*)
+              v
+Claude API (agent/brain.py)  ←→ agent/tools.py  (6 tools registradas)
+   |                                  ├── consultar_stock
+   |   loop while                     ├── agregar_al_carrito
+   |   stop_reason == tool_use:       ├── confirmar_pedido
+   |     ejecutar tool                ├── registrar_lead
+   |     pasarle el resultado         ├── escalar_a_humano
+   |     a Claude                     └── registrar_datos_factura
+   v
 Respuesta enviada de vuelta por WhatsApp
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  agent/dashboard/  (mismo FastAPI, /dashboard/*)         │
+  │    HTTP Basic Auth → routes.py → templates Jinja2        │
+  │    Lee de la misma BD para mostrar inbox/leads/pedidos   │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-El sistema usa un **patron adaptador** para proveedores de WhatsApp. Cada proveedor
-(Whapi, Meta, Twilio) implementa la misma interfaz, asi que `main.py` no sabe ni le
-importa cual estas usando. Solo llama `proveedor.parsear_webhook()` y
-`proveedor.enviar_mensaje()`.
+**Patrones clave:**
+
+- **Adaptador de proveedor** — Cada proveedor de WhatsApp (Whapi/Meta/Twilio) implementa la misma interfaz `ProveedorWhatsApp` con `parsear_webhook()` y `enviar_mensaje()`. `main.py` no sabe ni le importa cual estas usando.
+- **Tool-use loop** — `brain.py` itera mientras Claude pida tools (tope `MAX_TOOL_ITERATIONS=6`). Cada tool ejecuta logica de negocio y devuelve un JSON que Claude lee en la siguiente vuelta.
+- **Persistencia separada** — El carrito vive en memoria efimera (RAM), pero al confirmar el pedido se persiste a BD. Asi los reinicios no pierden ventas cerradas.
+- **Provider parsea ubicacion GPS** — Cuando el cliente comparte ubicacion con el boton nativo de WhatsApp, el provider la convierte a `"[UBICACION COMPARTIDA] Lat: X, Lng: Y · maps link"` para que Claude la lea como texto sin necesidad de campos estructurados extra.
 
 ---
 
