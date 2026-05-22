@@ -2055,7 +2055,59 @@ DASHBOARD_PASSWORD=cambiame-por-favor
 # LANGFUSE_PUBLIC_KEY=
 # LANGFUSE_SECRET_KEY=
 # LANGFUSE_HOST=https://cloud.langfuse.com
+
+# Multi-tenant (Fase 3, opcional)
+# MULTI_TENANT=false
+# ADMIN_USER=admin
+# ADMIN_PASSWORD=
 ```
+
+### Multi-tenant (Fase 3 — opcional, controlado por feature flag)
+
+Si el agente va a atender VARIOS negocios desde la misma instancia, AgentKit soporta multi-tenant con feature flag `MULTI_TENANT`. Cuando es `false` (default) el agente se comporta como antes: un solo negocio, lee `config/prompts.yaml`, etc. Cuando es `true`:
+
+- **Webhook ruteado por slug**: cada tenant configura su URL: `POST /webhook/<slug>`.
+- **Dashboard particionado**: `GET /dashboard/t/<slug>/` con HTTP Basic Auth contra las credenciales del tenant.
+- **Admin UI**: `GET /admin` con auth global (ADMIN_USER/ADMIN_PASSWORD) para crear/editar/listar tenants.
+- **Tokens por tenant**: cada tenant tiene su propio `whapi_token` y opcionalmente `anthropic_api_key` (si no lo provee, usa la global).
+- **Filesystem por tenant**: `tenants/<slug>/prompts.yaml` y `tenants/<slug>/knowledge/*`.
+
+**Schema:** tabla `tenants` (slug, nombre, whapi_token, anthropic_api_key, dashboard_user, dashboard_password, prompts_path, knowledge_dir, activo). Las tablas `mensajes/conversaciones/leads/pedidos` ganan una columna `tenant_id` (nullable — null indica modo single-tenant).
+
+**Aislamiento:** todas las queries en multi-tenant filtran por `tenant_id`. Carritos en memoria usan clave compuesta `(tenant_slug, telefono)`. La unicidad de `conversaciones.telefono` es por `(tenant_id, telefono)` no global.
+
+**Módulos nuevos:**
+- `agent/tenants.py` — `TenantCtx`, `get_tenant(slug)`, `get_tenant_default()`, `multi_tenant_activo()`.
+- `agent/admin/` — routes + templates Jinja2 para crear/editar/listar tenants + subir knowledge files.
+
+**Cambios en módulos existentes (en orden):**
+1. `agent/memory.py`: modelo `Tenant`; `tenant_id` (nullable) en cada tabla; todas las funciones públicas aceptan `tenant_id=None` y filtran si se pasa.
+2. `agent/brain.py`: `generar_respuesta(..., tenant=None)`; usa `tenant.prompts_path` y `tenant.anthropic_api_key` si están.
+3. `agent/tools.py`: todas las tools aceptan `tenant=None`; el carrito usa `(slug, telefono)` como clave; `consultar_stock`, `agregar_al_carrito` leen knowledge del directorio del tenant.
+4. `agent/providers/__init__.py`: añade `obtener_proveedor_para_tenant(tenant)` que crea un provider con los tokens del tenant.
+5. `agent/providers/whapi.py`: `__init__(self, token=None)` acepta token override; `enviar_mensaje` envuelve httpx en try/except para no crashear el webhook si Whapi cuelga.
+6. `agent/dashboard/auth.py`: añade `requerir_auth_tenant(slug, credentials)` y `requerir_auth_admin()`.
+7. `agent/dashboard/routes.py`: añade rama de rutas `/dashboard/t/{slug}/` paralela a la single-tenant; las templates usan `{{ base_path|default('/dashboard') }}` para construir URLs.
+8. `agent/main.py`: nuevos endpoints `POST /webhook/{slug}` y el handler común `_procesar_webhook(request, tenant)`. Las rutas single-tenant devuelven 404 si `MULTI_TENANT=true`.
+
+**Migración del schema** (idempotente, SQL contra Supabase/Postgres):
+```sql
+-- tabla tenants la crea SQLAlchemy.metadata.create_all() al startup
+ALTER TABLE mensajes        ADD COLUMN IF NOT EXISTS tenant_id INTEGER;
+ALTER TABLE conversaciones  ADD COLUMN IF NOT EXISTS tenant_id INTEGER;
+ALTER TABLE leads           ADD COLUMN IF NOT EXISTS tenant_id INTEGER;
+ALTER TABLE pedidos         ADD COLUMN IF NOT EXISTS tenant_id INTEGER;
+CREATE INDEX IF NOT EXISTS ix_mensajes_tenant_id        ON mensajes (tenant_id);
+CREATE INDEX IF NOT EXISTS ix_conversaciones_tenant_id  ON conversaciones (tenant_id);
+CREATE INDEX IF NOT EXISTS ix_leads_tenant_id           ON leads (tenant_id);
+CREATE INDEX IF NOT EXISTS ix_pedidos_tenant_id         ON pedidos (tenant_id);
+-- Relajar el UNIQUE global en telefono por uno compuesto
+DROP INDEX IF EXISTS ix_conversaciones_telefono;
+CREATE INDEX IF NOT EXISTS ix_conversaciones_telefono ON conversaciones (telefono);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_conversaciones_tenant_telefono ON conversaciones (tenant_id, telefono);
+```
+
+**Cuándo NO usar multi-tenant:** si el repo está dedicado a UN solo negocio (deploy a Railway por tenant), single-tenant es más simple y suficiente. Multi-tenant tiene sentido cuando una sola instancia atiende a varios negocios — caso típico SaaS.
 
 ### Módulo `agent/observability.py`
 

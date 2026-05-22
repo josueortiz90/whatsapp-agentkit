@@ -29,6 +29,9 @@ requirements.txt
 Dockerfile
 docker-compose.yml
 
+# Multi-tenant (Fase 3): cada usuario tendrá sus propios tenants
+tenants/
+
 # Session state
 config/session.yaml
 
