@@ -24,10 +24,23 @@ Tu solo respondes preguntas sobre tu negocio. Claude Code se encarga de:
 
 ### Paso 1: Tu clonas el repo y corres un comando
 
+**Mac / Linux:**
 ```bash
-git clone https://github.com/Hainrixz/claude-agentkit.git
-cd claude-agentkit
+git clone https://github.com/josueortiz90/whatsapp-agentkit.git
+cd whatsapp-agentkit
 bash start.sh
+```
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/josueortiz90/whatsapp-agentkit.git
+cd whatsapp-agentkit
+# start.sh requiere bash. Opciones en Windows:
+#   - Git Bash (viene con Git for Windows): bash start.sh
+#   - WSL: wsl bash start.sh
+#   - O simplemente verifica manualmente:
+#       python --version    # debe ser 3.11+
+#       claude --version    # Claude Code instalado
 ```
 
 `start.sh` solo verifica que tengas Python 3.11+ y Claude Code instalados.
@@ -167,10 +180,10 @@ El cliente recibe la respuesta en segundos
 Necesitas 4 cosas antes de empezar:
 
 ### 1. Python 3.11 o superior
-- **Mac**: `brew install python` o descarga de [python.org](https://python.org/downloads)
-- **Windows**: Descarga de [python.org](https://python.org/downloads) (marca "Add to PATH")
+- **Mac**: `brew install python` o descarga de [python.org](https://www.python.org/downloads/)
+- **Windows**: Descarga de [python.org](https://www.python.org/downloads/windows/) (marca "Add to PATH")
 - **Linux**: `sudo apt install python3.11`
-- Verifica: `python3 --version`
+- Verifica: `python3 --version` (en Windows: `python --version`)
 
 ### 2. Claude Code
 ```bash
@@ -203,11 +216,12 @@ claude
 
 ```bash
 # 1. Clona el repositorio
-git clone https://github.com/Hainrixz/claude-agentkit.git
-cd claude-agentkit
+git clone https://github.com/josueortiz90/whatsapp-agentkit.git
+cd whatsapp-agentkit
 
 # 2. Verifica tu entorno
-bash start.sh
+bash start.sh        # Mac/Linux/Git Bash
+#  En PowerShell sin Git Bash: verifica manual con `python --version` y `claude --version`
 
 # 3. Abre Claude Code y construye tu agente
 claude
