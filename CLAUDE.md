@@ -498,6 +498,9 @@ class ProveedorWhapi(ProveedorWhatsApp):
     async def parsear_webhook(self, request: Request) -> list[MensajeEntrante]:
         """Parsea el payload de Whapi.cloud.
 
+        Filtra mensajes de grupos (chat_id termina en `@g.us`): este agente es para
+        atención al cliente 1:1, no para participar en chats grupales.
+
         Soporta texto plano y mensajes tipo `location`/`live_location`. Cuando llega
         ubicación, se sintetiza un string que Claude puede leer sin campos extra:
             [UBICACIÓN COMPARTIDA] Lat: X, Lng: Y · https://maps.google.com/?q=X,Y
@@ -505,6 +508,11 @@ class ProveedorWhapi(ProveedorWhatsApp):
         body = await request.json()
         mensajes = []
         for msg in body.get("messages", []):
+            chat_id = msg.get("chat_id", "") or ""
+            if chat_id.endswith("@g.us"):
+                logger.info(f"Ignorando mensaje de grupo {chat_id}")
+                continue
+
             tipo = (msg.get("type") or "").lower()
             texto = ""
             if isinstance(msg.get("text"), dict):
@@ -523,7 +531,7 @@ class ProveedorWhapi(ProveedorWhatsApp):
                              f" · https://maps.google.com/?q={lat},{lng}{extras_txt}")
 
             mensajes.append(MensajeEntrante(
-                telefono=msg.get("chat_id", ""),
+                telefono=chat_id,
                 texto=texto,
                 mensaje_id=msg.get("id", ""),
                 es_propio=msg.get("from_me", False),
