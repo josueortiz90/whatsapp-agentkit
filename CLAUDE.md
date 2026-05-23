@@ -2156,6 +2156,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_conversaciones_tenant_telefono ON conversac
 
 **Cuándo NO usar multi-tenant:** si el repo está dedicado a UN solo negocio (deploy a Railway por tenant), single-tenant es más simple y suficiente. Multi-tenant tiene sentido cuando una sola instancia atiende a varios negocios — caso típico SaaS.
 
+**Gotcha cross-platform paths:** al guardar `prompts_path` y `knowledge_dir` en la tabla `tenants` desde un script o admin UI corriendo en Windows, NUNCA hacer `str(Path("tenants") / slug / "prompts.yaml")` — `str()` produce `tenants\slug\prompts.yaml` con backslashes. En Linux/Railway esos paths no se resuelven y `brain.py` cae al fallback genérico (el agente pierde su identidad y el catálogo). Usa SIEMPRE `.as_posix()` para forzar `/` o normaliza con `.replace("\\", "/")` antes de persistir. Defensivamente, `_path_prompts_para` y `_dir_knowledge_para` en `agent/tenants.py` deben normalizar el override por si la BD ya tiene paths con `\`.
+
 ### Módulo `agent/observability.py`
 
 Si el agente va a producción, conviene instrumentar con **Langfuse** (cloud o self-host) para ver costos por conversación, distribución de tools usadas, latencia y errores. El módulo debe ser tolerante a que las keys no estén: si no, el agente funciona sin tracing.
