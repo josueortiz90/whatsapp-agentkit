@@ -1288,13 +1288,29 @@ def agregar_al_carrito(telefono: str, codigo_o_nombre: str, cantidad: int = 1) -
     res = buscar_producto(codigo_o_nombre, limite=1)
     if not res: return {"ok": False, "mensaje": f"No encontré '{codigo_o_nombre}'."}
     p = res[0]
+    codigo = p.get("codigo")
     stock = int(p.get("stock", 0))
-    if cantidad > stock:
-        return {"ok": False, "mensaje": f"Solo hay {stock} {p.get('unidad','pieza')}(s)."}
-    item = {"codigo": p.get("codigo"), "nombre": p.get("nombre"), "marca": p.get("marca"),
-            "precio_mxn": float(p.get("precio_mxn", 0)), "cantidad": cantidad,
-            "subtotal": float(p.get("precio_mxn", 0)) * cantidad}
-    _CARRITOS.setdefault(telefono, []).append(item)
+    precio = float(p.get("precio_mxn", 0))
+    unidad = p.get("unidad", "pieza")
+
+    # Idempotencia: si Claude llama 2 veces con el mismo código en el mismo turno,
+    # se suma a la línea existente en lugar de duplicarla. Stock se valida contra
+    # la cantidad total resultante, no solo la nueva.
+    carrito = _CARRITOS.setdefault(telefono, [])
+    existente = next((it for it in carrito if it.get("codigo") == codigo), None)
+    ya_en_carrito = existente["cantidad"] if existente else 0
+    cantidad_total = ya_en_carrito + cantidad
+    if cantidad_total > stock:
+        sufijo = f" y ya tienes {ya_en_carrito} en el carrito" if ya_en_carrito else ""
+        return {"ok": False, "mensaje": f"Solo hay {stock} {unidad}(s) en stock{sufijo}."}
+    if existente:
+        existente["cantidad"] = cantidad_total
+        existente["subtotal"] = precio * cantidad_total
+        item = existente
+    else:
+        item = {"codigo": codigo, "nombre": p.get("nombre"), "marca": p.get("marca"),
+                "precio_mxn": precio, "cantidad": cantidad, "subtotal": precio * cantidad}
+        carrito.append(item)
     return {"ok": True, "item": item, "total_actual": _total(telefono)}
 
 
