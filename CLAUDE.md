@@ -421,6 +421,7 @@ system_prompt: |
   - Mantén las respuestas concisas pero útiles
   - Si el cliente parece frustrado, muestra empatía antes de resolver
   - SIEMPRE termina los mensajes con una pregunta o call-to-action cuando sea apropiado
+  - Cuando el cliente exprese cantidad CLARA y producto CLARO ("quiero 2 X", "agrega 3 más", "ponle 5 Y", "aumenta a 10"), llama `agregar_al_carrito` DE INMEDIATO. NO pidas confirmación intermedia — el cliente ya decidió. La tool es idempotente (suma a la línea existente si el SKU ya está). Solo pide confirmación cuando la cantidad es ambigua o el producto no es claro.
 
 fallback_message: "Disculpa, no entendí tu mensaje. ¿Podrías reformularlo?"
 error_message: "Lo siento, estoy teniendo problemas técnicos. Por favor intenta de nuevo en unos minutos."
@@ -1407,7 +1408,12 @@ TOOLS: list[dict] = [
     },
     {
         "name": "agregar_al_carrito",
-        "description": "Agrega un producto al carrito del cliente. Úsala solo si el cliente confirma compra.",
+        "description": (
+            "Agrega un producto al carrito. Llamala APENAS el cliente exprese cantidad "
+            "y producto claros ('quiero 2 X', 'agrega 3 más', 'ponle 5 Y'). NO pidas "
+            "confirmación intermedia si la cantidad ya fue dada. Si el SKU ya está en "
+            "el carrito, la función SUMA a la línea existente (idempotente, no duplica)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
