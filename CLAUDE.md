@@ -1703,7 +1703,7 @@ async def actualizar_estado_pedido(pedido_id: int, estado: str = Form(...),
 ```
 
 **`agent/dashboard/templates/`** — 5 archivos HTML con Jinja2.
-- `base.html`: layout, nav, KPIs, estilos inline (no necesita assets).
+- `base.html`: layout, nav, KPIs, estilos inline (no necesita assets). Incluye un `<script>` inline al final del `<body>` que recarga la página cada 5s vía `location.reload()`, con dos pausas: (a) si `document.hidden` (pestaña en background) y (b) si `document.activeElement.tagName` es `INPUT`/`TEXTAREA`/`SELECT` — así el operador no pierde lo que está escribiendo en formularios inline.
 - `inbox.html`: tabla de conversaciones con filtros (todas/pendientes/atendidas/escaladas).
 - `conversacion.html`: hilo de mensajes + panel lateral con acciones (marcar atendida, crear lead, notas).
 - `leads.html`: tabla con filtro por status (nuevo/contactado/cliente/perdido) y formularios inline para cambiar status.
