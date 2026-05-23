@@ -1267,17 +1267,40 @@ def _cargar_productos() -> list[dict]:
     return []
 
 
+_STOPWORDS = {
+    "de", "la", "el", "los", "las", "un", "una", "uno", "y", "o",
+    "con", "para", "del", "al", "en", "a", "que", "es", "su", "se",
+    "lo", "le", "mi", "tu", "me", "te", "por",
+}
+
+
+def _tokenizar_consulta(consulta: str) -> list[str]:
+    """Tokeniza y agrega stems suaves (sin 's'/'es' final) para tolerar plurales."""
+    tokens: list[str] = []
+    for raw in (consulta or "").lower().split():
+        t = raw.strip(".,;:!?¿¡()\"'")
+        if len(t) < 3 or t in _STOPWORDS:
+            continue
+        tokens.append(t)
+        if len(t) > 4 and t.endswith("es"):
+            tokens.append(t[:-2])
+        elif len(t) > 3 and t.endswith("s"):
+            tokens.append(t[:-1])
+    return tokens
+
+
 def buscar_producto(consulta: str, limite: int = 5) -> list[dict]:
-    consulta = (consulta or "").strip().lower()
-    if not consulta: return []
+    """Búsqueda por tokens con stem suave. Tolera plurales y queries multi-palabra."""
+    tokens = _tokenizar_consulta(consulta)
+    if not tokens: return []
     productos = _cargar_productos()
-    out = []
+    candidatos: list[tuple[int, dict]] = []
     for p in productos:
-        campos = " ".join(str(p.get(k, "")) for k in ("codigo", "nombre", "marca", "categoria"))
-        if consulta in campos.lower():
-            out.append(p)
-            if len(out) >= limite: break
-    return out
+        campos = " ".join(str(p.get(k, "")) for k in ("codigo", "nombre", "marca", "categoria")).lower()
+        score = sum(1 for t in tokens if t in campos)
+        if score > 0: candidatos.append((score, p))
+    candidatos.sort(key=lambda x: -x[0])
+    return [p for _, p in candidatos[:limite]]
 
 
 def consultar_stock(consulta: str) -> dict:
